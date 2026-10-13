@@ -145,6 +145,9 @@ class PlayerObject(GObject.GObject):
 
         # next track variables for gapless
         self.next_track: Any | None = None
+        # the last track requested for gapless playback, dropped if another track
+        # is played directly while it loads
+        self.gapless_request: Track | None = None
 
         # for not caching on metered networks
         self.monitor = Gio.NetworkMonitor.get_default()
@@ -450,6 +453,8 @@ class PlayerObject(GObject.GObject):
             track: The Track object to play
             gapless: Whether to enqueue the track for gapless playback
         """
+        if gapless:
+            self.gapless_request = track
         threading.Thread(target=self._play_track_thread, args=(track, gapless)).start()
 
     def _play_track_thread(self, track: Track, gapless=False) -> None:
@@ -609,7 +614,14 @@ class PlayerObject(GObject.GObject):
 
     def _play_track_url(self, track, music_url, gapless=False):
         """Set up and play track from URL."""
+        if gapless and track is not self.gapless_request:
+            logger.info(f"Dropping gapless track {track.id}: another track was played")
+            return
         if not gapless:
+            # A track played directly replaces the one queued for gapless playback,
+            # which would otherwise be shown as playing when this one starts
+            self.gapless_request = None
+            self.next_track = None
             self.use_about_to_finish = False
             self.pipeline.set_state(Gst.State.NULL)
             self.playbin.set_property("volume", self.playbin.get_property("volume"))
