@@ -250,7 +250,7 @@ class PlayerObject(GObject.GObject):
         """Handle end of stream."""
         if not self.gapless_enabled:
             GLib.idle_add(self.play_next)
-        elif not self.tracks_to_play and not self.queue:
+        elif not self._has_next_track():
             self.pause()
 
     def _on_bus_error(self, bus: Any, message: Any) -> None:
@@ -635,11 +635,19 @@ class PlayerObject(GObject.GObject):
             playbin: required by Gst
         """
         # playbin is need as arg but we access it later over self
-        if self.gapless_enabled and self.use_about_to_finish and self.tracks_to_play:
+        if self.gapless_enabled and self.use_about_to_finish and self._has_next_track():
             GLib.idle_add(self.play_next, True)
             logger.info("Trying gapless playbck")
         else:
             logger.info("Ignoring about to finish event")
+
+    def _has_next_track(self) -> bool:
+        """Whether play_next will play a track after the current one"""
+        return bool(
+            self.tracks_to_play
+            or self.queue
+            or (self.playing_track and self._repeat_type != RepeatType.NONE)
+        )
 
     def play_next(self, gapless=False):
         """Play the next track in the queue or playlist.
@@ -672,12 +680,12 @@ class PlayerObject(GObject.GObject):
             self.play_track(track, gapless=gapless)
             return
 
-        if not self._tracks_to_play and self._repeat_type == RepeatType.LIST:
+        if not self.tracks_to_play and self._repeat_type == RepeatType.LIST:
             self._tracks_to_play = self.played_songs
-            self.tracks_to_play = self._tracks_to_play
             self.played_songs = []
+            self._update_shuffle_queue()
 
-        if not self._tracks_to_play:
+        if not self.tracks_to_play:
             self.pause()
             return
 
