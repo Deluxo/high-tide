@@ -17,11 +17,14 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import hashlib
 import html
+import json
 import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 import logging
 from gettext import gettext as _
@@ -41,7 +44,7 @@ from tidalapi.playlist import Playlist
 from tidalapi.media import Track
 from tidalapi.types import ItemOrder, OrderDirection
 
-from ..pages import HTAlbumPage, HTArtistPage, HTMixPage, HTPlaylistPage
+
 from .cache import HTCache
 
 logger = logging.getLogger(__name__)
@@ -62,12 +65,13 @@ def init() -> None:
     and initializes the global cache object for TIDAL API responses.
     """
     global CACHE_DIR
-    CACHE_DIR = os.environ.get("XDG_CACHE_HOME")
-    if CACHE_DIR == "" or CACHE_DIR is None or "high-tide" not in CACHE_DIR:
-        CACHE_DIR = f"{os.environ.get('HOME')}/.cache/high-tide"
-
-    CACHE_DIR = Path(CACHE_DIR)
-    CACHE_DIR.mkdir(exist_ok=True)
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache and Path(xdg_cache).name == "high-tide":
+        CACHE_DIR = Path(xdg_cache)
+    else:
+        base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+        CACHE_DIR = base / "high-tide"
+    CACHE_DIR.mkdir(exist_ok=True, parents=True)
 
     global IMG_DIR
     IMG_DIR = Path(CACHE_DIR, "images")
@@ -469,6 +473,7 @@ def open_uri(label: str, uri: str) -> bool:
         label: Display label for the URI (currently unused)
         uri: A URI string in format "type:id" (e.g., "artist:123456")
     """
+    from ..pages import HTAlbumPage, HTArtistPage
     uri_parts = uri.split(":")
 
     match uri_parts[0]:
@@ -485,6 +490,7 @@ def open_uri(label: str, uri: str) -> bool:
 
 def open_tidal_uri(uri: str) -> None:
     """Handles opening uri like tidal://track/1234"""
+    from ..pages import HTAlbumPage, HTArtistPage, HTMixPage, HTPlaylistPage
 
     if not uri.startswith("tidal://"):
         raise ValueError("Invalid URI format: URI must start with 'tidal://'")
@@ -800,11 +806,103 @@ def replace_links(text: str) -> str:
     return replaced_text
 
 
+#
+#   HOME PAGE DISK CACHE
+#
+
+
+class _ApiCache:
+    """Disk cache for TIDAL API GET responses (see ADR 0001)."""
+
+    max_age = 24 * 60 * 60
+
+    def __init__(self, cache_dir: Path):
+        self.root = Path(cache_dir) / "api"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.user_id: str | None = None
+        self._original_request = None
+
+    def install(self, request_session: requests.Session) -> None:
+        self._original_request = request_session.request
+
+        def cached_request(method, url, **kwargs):
+            if not self._cacheable(method, url):
+                return self._original_request(method, url, **kwargs)
+
+            path = self._path(url, kwargs.get("params"))
+            cached = self._read(path)
+            if cached is not None:
+                return self._response(url, cached)
+
+            response = self._original_request(method, url, **kwargs)
+            if response.status_code == 200:
+                self._write(path, response)
+            return response
+
+        request_session.request = cached_request
+
+    def _cacheable(self, method, url) -> bool:
+        return (
+            method.upper() == "GET"
+            and "api.tidal.com" in url
+            and "playbackinfo" not in url
+        )
+
+    def _path(self, url, params) -> Path:
+        raw = f"{url}|{sorted((params or {}).items())}"
+        digest = hashlib.sha256(raw.encode()).hexdigest()[:32]
+        user_dir = self.root / (self.user_id or "anon")
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return user_dir / f"{digest}.json"
+
+    def _read(self, path: Path) -> dict | None:
+        try:
+            with open(path) as f:
+                envelope = json.load(f)
+            if time.time() - envelope["ts"] > self.max_age:
+                return None
+            return {"body": envelope["body"], "headers": envelope.get("headers", {})}
+        except Exception:
+            return None
+
+    def _write(self, path: Path, response: requests.Response) -> None:
+        try:
+            headers = {k: v for k, v in response.headers.items()}
+            with open(path, "w") as f:
+                json.dump({"ts": time.time(), "body": response.text, "headers": headers}, f)
+        except Exception:
+            logger.exception("Could not write API cache")
+
+    def _response(self, url: str, cached: dict) -> requests.Response:
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        response._content = cached["body"].encode()
+        response.headers = requests.structures.CaseInsensitiveDict(cached.get("headers", {}))
+        response.request = requests.PreparedRequest()
+        response.request.url = url
+        return response
+
+
+def _api_cache():
+    request_session = getattr(session, "request_session", None)
+    return getattr(request_session, "_api_cache", None)
+
+
+def set_cache_user(user_id: str | None) -> None:
+    cache = _api_cache()
+    if cache is not None and user_id is not None:
+        cache.user_id = user_id
+
+
 def create_tidal_session():
     tidal_session = tidalapi.Session()
     retry = Retry(connect=3, backoff_factor=0.5)
-    adapter = HTTPAdapter(max_retries=retry)
-    tidal_session.request_session.mount("https://", adapter)
+    request_session = tidal_session.request_session
+    request_session.mount("https://", HTTPAdapter(max_retries=retry))
+    api_cache = _ApiCache(CACHE_DIR)
+    api_cache.install(request_session)
+    request_session._api_cache = api_cache
     return tidal_session
 
 

@@ -261,8 +261,9 @@ class HighTideWindow(Adw.ApplicationWindow):
             logger.exception("Error while logging in!")
             GLib.idle_add(self.on_login_failed)
         else:
-            utils.get_favourites()
+            utils.set_cache_user(str(self.session.user.id))
             GLib.idle_add(self.on_logged_in)
+            threading.Thread(target=utils.get_favourites, daemon=True).start()
 
     def logout(self):
         """Log out the current user and return to login screen.
