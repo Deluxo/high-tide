@@ -19,7 +19,7 @@
 
 from gettext import gettext as _
 
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk
 
 from .track_list_page import TrackListPage
 from ..lib import utils
@@ -49,3 +49,7 @@ class HTAlbumPage(TrackListPage):
         self._setup_ui(
             builder, title, subtitle, self.top_tracks, reload_function=self.item.tracks
         )
+
+        info_button = builder.get_object("_info_button")
+        info_button.set_action_target_value(GLib.Variant("s", str(self.item.id)))
+        info_button.set_visible(True)
