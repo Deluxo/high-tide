@@ -78,6 +78,10 @@ Box _main {
               valign: center;
 
               Adw.LayoutSlot {
+                id: "playlist-menu-button";
+              }
+
+              Adw.LayoutSlot {
                 id: "share-button";
               }
 
@@ -169,6 +173,10 @@ Box _main {
             Adw.LayoutSlot {
               id: "share-button";
             }
+
+            Adw.LayoutSlot {
+              id: "playlist-menu-button";
+            }
           }
         };
       }
@@ -225,6 +233,19 @@ Box _main {
       [artist-button]
       Button _artist_button {
         visible: false;
+      }
+
+      [playlist-menu-button]
+      MenuButton _playlist_menu_button {
+        icon-name: "view-more-symbolic";
+        tooltip-text: _("Playlist Options");
+        valign: center;
+        visible: false;
+
+        styles [
+          "flat",
+          "circular",
+        ]
       }
 
       [share-button]
