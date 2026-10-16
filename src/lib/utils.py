@@ -44,7 +44,6 @@ from tidalapi.playlist import Playlist
 from tidalapi.media import Track
 from tidalapi.types import ItemOrder, OrderDirection
 
-
 from .cache import HTCache
 
 logger = logging.getLogger(__name__)
