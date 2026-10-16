@@ -56,6 +56,7 @@ user_playlists: List[Playlist] = []
 blocked_artists: List[Artist] = []
 blocked_tracks: List[Track] = []
 blocked_videos: List[Video] = []
+blocked_loaded = threading.Event()
 
 
 def init() -> None:
@@ -354,6 +355,7 @@ def get_blocked() -> None:
     except Exception:
         logger.exception("Error while getting blocked items")
 
+    blocked_loaded.set()
 
     logger.info(f"Blocked Artists: {len(blocked_artists)}")
     logger.info(f"Blocked Tracks: {len(blocked_tracks)}")
@@ -424,6 +426,26 @@ def is_blocked_by_artist(item: Any) -> bool:
 
     artists = getattr(item, "artists", None) or []
     return any(is_blocked(artist) for artist in artists)
+
+
+def is_hidden_by_block(item: Any) -> bool:
+    """Check if an item should be left out of suggestions because of a block.
+
+    Args:
+        item: A TIDAL object
+
+    Returns:
+        bool: True for blocked artists, and tracks, videos and albums that are
+            blocked or by a blocked artist
+    """
+    if isinstance(item, Artist):
+        return is_blocked(item)
+    if isinstance(item, (Track, Video)):
+        return is_blocked_by_artist(item)
+    if isinstance(item, Album):
+        artists = item.artists or [item.artist]
+        return any(artist and is_blocked(artist) for artist in artists)
+    return False
 
 
 def th_block(item: Any, callback: Any = None) -> None:
