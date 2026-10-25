@@ -21,17 +21,32 @@ template $HTGenericTrackWidget: ListBoxRow {
       margin-start: 6;
       margin-end: 6;
 
-      Image image {
-        pixel-size: 44;
-        icon-name: "emblem-music-symbolic";
-        overflow: hidden;
+      Overlay {
         margin-end: 12;
         margin-bottom: 6;
         margin-top: 6;
 
-        styles [
-          "small-image",
-        ]
+        Image image {
+          pixel-size: 44;
+          icon-name: "emblem-music-symbolic";
+          overflow: hidden;
+
+          styles [
+            "small-image",
+          ]
+        }
+
+        [overlay]
+        Image {
+          icon-name: "media-playback-start-symbolic";
+          pixel-size: 24;
+          can-target: false;
+
+          styles [
+            "small-image",
+            "track-hover-play",
+          ]
+        }
       }
 
       Grid _grid {
