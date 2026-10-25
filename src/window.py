@@ -238,7 +238,7 @@ class HighTideWindow(Adw.ApplicationWindow):
             self.secret_portal_dialog.present(self)
             return
 
-        MPRIS(self.player_object)
+        MPRIS(self.player_object, self)
 
         self.portal = Xdp.Portal()
         self.portal.set_background_status(_("Playing Music"))
