@@ -164,6 +164,9 @@ class PlayerObject(GObject.GObject):
         # a gapless track is being loaded / the current one ended before it was
         self.loading_gapless = False
         self.reached_eos = False
+        # the last track requested for gapless playback, dropped if another track
+        # is played directly while it loads
+        self.gapless_request: Track | None = None
 
         # for not caching on metered networks
         self.monitor = Gio.NetworkMonitor.get_default()
@@ -531,6 +534,7 @@ class PlayerObject(GObject.GObject):
             self.next_track = track
             return
         if gapless:
+            self.gapless_request = track
             self.loading_gapless = True
         threading.Thread(target=self._play_track_thread, args=(track, gapless)).start()
 
@@ -555,6 +559,8 @@ class PlayerObject(GObject.GObject):
             logger.exception("Error getting track URL")
             if gapless:
                 self.loading_gapless = False
+                if self.gapless_request is track:
+                    self.gapless_request = None
 
     def _play_cached_track(self, track, cached_music, gapless=False) -> None:
         """Play a track from the music cache.
@@ -742,11 +748,21 @@ class PlayerObject(GObject.GObject):
     def _play_track_url(self, track, music_url, gapless=False):
         """Set up and play track from URL."""
         if gapless:
+            if track is not self.gapless_request:
+                logger.info(
+                    f"Dropping gapless track {track.id}: another track was played"
+                )
+                return
+            self.gapless_request = None
             self.loading_gapless = False
             if self.reached_eos:
                 # Too late for gapless, the previous track already ended
                 gapless = False
         if not gapless:
+            # A track played directly replaces the one queued for gapless playback,
+            # which would otherwise be shown as playing when this one starts
+            self.gapless_request = None
+            self.next_track = None
             self.reached_eos = False
             self.use_about_to_finish = False
             self.pipeline.set_state(Gst.State.NULL)
