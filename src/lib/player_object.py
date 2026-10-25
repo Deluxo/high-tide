@@ -279,7 +279,7 @@ class PlayerObject(GObject.GObject):
         elif self.next_track or self.tracks_to_play or self.queue:
             logger.warning("Track ended without switching to the next one")
             self.play_next()
-        else:
+        elif not self._has_next_track():
             self.pause()
 
     def _on_bus_error(self, bus: Any, message: Any) -> None:
@@ -790,7 +790,7 @@ class PlayerObject(GObject.GObject):
             playbin: required by Gst
         """
         # playbin is need as arg but we access it later over self
-        if self.gapless_enabled and self.use_about_to_finish and self.tracks_to_play:
+        if self.gapless_enabled and self.use_about_to_finish and self._has_next_track():
             # The current track can reach EOS soon after this signal, and then
             # a uri set later is ignored, so set it now if it's ready
             self._set_prefetched_uri()
@@ -859,6 +859,14 @@ class PlayerObject(GObject.GObject):
         self.handed_off_track = track
         logger.info(f"Using prefetched stream: {music_url}")
 
+    def _has_next_track(self) -> bool:
+        """Whether play_next will play a track after the current one"""
+        return bool(
+            self.tracks_to_play
+            or self.queue
+            or (self.playing_track and self._repeat_type != RepeatType.NONE)
+        )
+
     def play_next(self, gapless=False):
         """Play the next track in the queue or playlist.
 
@@ -890,12 +898,12 @@ class PlayerObject(GObject.GObject):
             self.play_track(track, gapless=gapless)
             return
 
-        if not self._tracks_to_play and self._repeat_type == RepeatType.LIST:
+        if not self.tracks_to_play and self._repeat_type == RepeatType.LIST:
             self._tracks_to_play = self.played_songs
-            self.tracks_to_play = self._tracks_to_play
             self.played_songs = []
+            self._update_shuffle_queue()
 
-        if not self._tracks_to_play:
+        if not self.tracks_to_play:
             self.pause()
             return
 
