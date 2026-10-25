@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 import logging
+from contextlib import contextmanager
 from gettext import gettext as _
 from pathlib import Path
 from typing import Any, List
@@ -356,8 +357,20 @@ def get_favourites() -> None:
     logger.info(f"User Playlists: {len(user_playlists)}")
 
 
-def get_playlists() -> None:
-    """Load the user's playlists, and their playlists plus favorite playlists."""
+def get_playlists(fresh: bool = False) -> None:
+    """Load the user's playlists, and their playlists plus favorite playlists.
+
+    Args:
+        fresh: Bypass the API disk cache, e.g. after a playlist was changed
+    """
+    if fresh:
+        with _fresh_api_requests():
+            _load_playlists()
+    else:
+        _load_playlists()
+
+
+def _load_playlists() -> None:
     global playlist_and_favorite_playlists
     global user_playlists
 
@@ -427,9 +440,12 @@ def get_blocked() -> None:
     global blocked_videos
 
     try:
-        blocked_artists = _get_blocked_items("artists", session.parse_artist)
-        blocked_tracks = _get_blocked_items("tracks", session.parse_track)
-        blocked_videos = _get_blocked_items("videos", session.parse_video)
+        # Blocks change when the user blocks or unblocks something, so don't
+        # serve these from the API disk cache
+        with _fresh_api_requests():
+            blocked_artists = _get_blocked_items("artists", session.parse_artist)
+            blocked_tracks = _get_blocked_items("tracks", session.parse_track)
+            blocked_videos = _get_blocked_items("videos", session.parse_video)
     except Exception:
         logger.exception("Error while getting blocked items")
 
@@ -747,7 +763,7 @@ def _get_fresh_user_playlist(playlist: Playlist) -> UserPlaylist:
 
 
 def _on_playlists_changed() -> None:
-    get_playlists()
+    get_playlists(fresh=True)
     GLib.idle_add(_update_collection_page)
 
 
@@ -765,7 +781,8 @@ def th_add_to_playlist(playlist: Playlist, track: Track) -> None:
         track: The track to add
     """
     try:
-        added = _get_fresh_user_playlist(playlist).add([str(track.id)])
+        with _fresh_api_requests():
+            added = _get_fresh_user_playlist(playlist).add([str(track.id)])
     except Exception:
         logger.exception(f"Failed to add {track.id} to playlist {playlist.id}")
         GLib.idle_add(send_toast, _("Failed to add to playlist"), 2)
@@ -789,14 +806,15 @@ def th_remove_from_playlist(
         callback: Called on the main thread after the track is removed
     """
     try:
-        fresh = _get_fresh_user_playlist(playlist)
-        at_index = (
-            fresh.tracks(limit=1, offset=index) if index is not None else []
-        )
-        if at_index and at_index[0].id == track.id:
-            removed = fresh.remove_by_index(index)
-        else:
-            removed = fresh.remove_by_id(str(track.id))
+        with _fresh_api_requests():
+            fresh = _get_fresh_user_playlist(playlist)
+            at_index = (
+                fresh.tracks(limit=1, offset=index) if index is not None else []
+            )
+            if at_index and at_index[0].id == track.id:
+                removed = fresh.remove_by_index(index)
+            else:
+                removed = fresh.remove_by_id(str(track.id))
     except Exception:
         logger.exception(f"Failed to remove {track.id} from playlist {playlist.id}")
         removed = False
@@ -868,10 +886,11 @@ def th_edit_playlist(
         callback: Called on the main thread with the edited playlist
     """
     try:
-        fresh = _get_fresh_user_playlist(playlist)
-        if not fresh.edit(title, description):
-            raise RuntimeError("edit failed")
-        fresh = _get_fresh_user_playlist(playlist)
+        with _fresh_api_requests():
+            fresh = _get_fresh_user_playlist(playlist)
+            if not fresh.edit(title, description):
+                raise RuntimeError("edit failed")
+            fresh = _get_fresh_user_playlist(playlist)
     except Exception:
         logger.exception(f"Failed to edit playlist {playlist.id}")
         GLib.idle_add(send_toast, _("Failed to save the playlist"), 2)
@@ -893,11 +912,12 @@ def th_set_playlist_public(
         callback: Called on the main thread with the changed playlist
     """
     try:
-        fresh = _get_fresh_user_playlist(playlist)
-        if public:
-            fresh.set_playlist_public()
-        else:
-            fresh.set_playlist_private()
+        with _fresh_api_requests():
+            fresh = _get_fresh_user_playlist(playlist)
+            if public:
+                fresh.set_playlist_public()
+            else:
+                fresh.set_playlist_private()
     except Exception:
         logger.exception(f"Failed to change playlist {playlist.id} visibility")
         GLib.idle_add(send_toast, _("Failed to change the playlist"), 2)
@@ -919,8 +939,9 @@ def th_delete_playlist(playlist: Playlist, callback: Any = None) -> None:
         callback: Called on the main thread after the playlist is deleted
     """
     try:
-        if not _get_fresh_user_playlist(playlist).delete():
-            raise RuntimeError("delete failed")
+        with _fresh_api_requests():
+            if not _get_fresh_user_playlist(playlist).delete():
+                raise RuntimeError("delete failed")
     except Exception:
         logger.exception(f"Failed to delete playlist {playlist.id}")
         GLib.idle_add(send_toast, _("Failed to delete the playlist"), 2)
@@ -1367,13 +1388,31 @@ class _ApiCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self.user_id: str | None = None
         self._original_request = None
+        # Set per thread when requests must not be served from the cache
+        self._local = threading.local()
+
+    @contextmanager
+    def fresh_requests(self):
+        """Bypass the cache for requests made from this thread in the block."""
+        previous = getattr(self._local, "bypass", False)
+        self._local.bypass = True
+        try:
+            yield
+        finally:
+            self._local.bypass = previous
 
     def install(self, request_session: requests.Session) -> None:
         self._original_request = request_session.request
 
         def cached_request(method, url, **kwargs):
-            if not self._cacheable(method, url):
-                return self._original_request(method, url, **kwargs)
+            cacheable = self._cacheable(method, url)
+            bypass = getattr(self._local, "bypass", False)
+            if not cacheable or bypass:
+                response = self._original_request(method, url, **kwargs)
+                if cacheable and response.status_code == 200:
+                    # Refresh the cache with the fresh response
+                    self._write(self._path(url, kwargs.get("params")), response)
+                return response
 
             path = self._path(url, kwargs.get("params"))
             cached = self._read(path)
@@ -1439,6 +1478,21 @@ def set_cache_user(user_id: str | None) -> None:
     cache = _api_cache()
     if cache is not None and user_id is not None:
         cache.user_id = user_id
+
+
+@contextmanager
+def _fresh_api_requests():
+    """Bypass the API disk cache for requests made in the block.
+
+    Used after changing playlists or blocks, where the cached GET responses
+    would still describe the old state.
+    """
+    cache = _api_cache()
+    if cache is None:
+        yield
+    else:
+        with cache.fresh_requests():
+            yield
 
 
 def create_tidal_session():
