@@ -28,8 +28,8 @@ from tidalapi.media import Quality
 from .lib import HTCache, PlayerObject, RepeatType, SecretStore, utils
 from .login import LoginDialog
 from .mpris import MPRIS
-from .pages import (HTAlbumPage, HTArtistPage, HTCollectionPage, HTExplorePage,
-                    HTGenericPage, HTMixPage, HTNotLoggedInPage,
+from .pages import (HTAlbumPage, HTArtistPage, HTCollectionPage, HTCreditsPage,
+                    HTExplorePage, HTGenericPage, HTMixPage, HTNotLoggedInPage,
                     HTPlaylistPage)
 from .widgets import (HTGenericTrackWidget, HTLinkLabelWidget, HTLyricsWidget,
                       HTQueueWidget)
@@ -141,6 +141,18 @@ class HighTideWindow(Adw.ApplicationWindow):
         self.add_action(toggle_block_track_action)
 
         self.block_button.connect("notify::active", self.on_block_button_active)
+
+        self.create_action_with_target(
+            "push-track-credits-page",
+            GLib.VariantType.new("s"),
+            self.on_push_track_credits_page,
+        )
+
+        self.create_action_with_target(
+            "push-album-info-page",
+            GLib.VariantType.new("s"),
+            self.on_push_album_info_page,
+        )
 
         # self.create_action_with_target(
         #     'play-next',
@@ -843,6 +855,18 @@ class HighTideWindow(Adw.ApplicationWindow):
             return
         id = parameter.get_string()
         utils.push_page(f"album-{id}", lambda: HTAlbumPage.new_from_id(id).load())
+
+    def on_push_track_credits_page(self, action, parameter):
+        if parameter.get_string() == "":
+            return
+        page = HTCreditsPage.new_for_track(parameter.get_string()).load()
+        self.navigation_view.push(page)
+
+    def on_push_album_info_page(self, action, parameter):
+        if parameter.get_string() == "":
+            return
+        page = HTCreditsPage.new_for_album(parameter.get_string()).load()
+        self.navigation_view.push(page)
 
     def on_push_playlist_page(self, action, parameter):
         if parameter.get_string() == "":
