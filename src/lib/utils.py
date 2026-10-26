@@ -1132,6 +1132,12 @@ def get_best_dimensions(widget: Any) -> int:
         int: The best image dimension from available sizes (80, 160, 320, 640, 1280)
     """
     edge = widget.get_height()
+    if edge <= 0:
+        # The widget hasn't been allocated yet, e.g. the player sheet is
+        # closed. Falling back to the smallest size would cache a tiny image
+        # that stays pixelated once the sheet is opened, so use the player
+        # cover's usual size instead.
+        edge = 300
     dimensions = [80, 160, 320, 640, 1280]
     # The function for fractional scaling is not available in GTKWidget
     scale = 1.0
