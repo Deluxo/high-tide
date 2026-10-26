@@ -191,5 +191,12 @@ menu track_menu {
 
   submenu playlists_submenu {
     label: _("Add to a playlist");
+
+    section {
+      item {
+        action: "trackwidget.new-playlist";
+        label: _("New playlist…");
+      }
+    }
   }
 }
