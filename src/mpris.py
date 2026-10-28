@@ -132,6 +132,9 @@ class MPRIS(Server):
                 <arg name="TrackId" direction="in" type="o"/>
                 <arg name="Position" direction="in" type="x"/>
             </method>
+            <signal name="Seeked">
+                <arg name="Position" type="x"/>
+            </signal>
             <property name="PlaybackStatus" type="s" access="read"/>
             <property name="Metadata" type="a{sv}" access="read"/>
             <property name="Position" type="x" access="read"/>
@@ -192,43 +195,6 @@ class MPRIS(Server):
         self.player.connect("notify::repeat-type", self._on_repeat_changed)
         self.player.connect("volume-changed", self._on_volume_changed)
 
-        self.start_position_updates()
-
-    def start_position_updates(self):
-        """Start a repeating timer to update the MPRIS Position property."""
-        GLib.timeout_add(500, self._update_position)  # update every 500ms
-
-    def _update_position(self):
-        if self.player.playing_track:
-            duration = self.player.query_duration() / 1000
-
-            if (
-                duration > 0
-                and self.__metadata.get(
-                    "mpris:length", GLib.Variant("x", 0)
-                ).get_int64()
-                != duration
-            ):
-                self.__metadata["mpris:length"] = GLib.Variant("x", int(duration))
-                self.PropertiesChanged(
-                    self.__MPRIS_PLAYER_IFACE,
-                    {
-                        "Metadata": GLib.Variant("a{sv}", self.__metadata),
-                    },
-                    [],
-                )
-
-            self.PropertiesChanged(
-                self.__MPRIS_PLAYER_IFACE,
-                {
-                    "Position": GLib.Variant(
-                        "x", int(self.player.query_position() / 1000)
-                    )
-                },
-                [],
-            )
-        return True
-
     def Raise(self):
         """Bring the High Tide application window to the foreground"""
         utils.window.present_with_time(Gdk.CURRENT_TIME)
@@ -275,23 +241,15 @@ class MPRIS(Server):
 
         self.player.seek(seek_fraction)
 
-        self.PropertiesChanged(
-            self.__MPRIS_PLAYER_IFACE,
-            {"Position": GLib.Variant("x", int(new_pos_us))},
-            [],
-        )
+        self._emit_seeked(new_pos_us)
 
     def SetPosition(self, track_id, position):
-        """Set the playback position to a specific point (position in microseconds)"""
-        duration_us = self.player.query_duration() / 1000
+        """Set the playback position to a specific point (position in microseconds)
 
-        position = max(0, min(position, duration_us))
-
-        self.PropertiesChanged(
-            self.__MPRIS_PLAYER_IFACE,
-            {"Position": GLib.Variant("x", int(position))},
-            [],
-        )
+        Intentionally ignored: some head units treat a seek as
+        pause -> seek -> play, which makes their play/pause indicator flicker.
+        """
+        pass
 
     def Get(self, interface, property_name):
         """Get the value of a specific MPRIS property.
@@ -407,6 +365,21 @@ class MPRIS(Server):
             ),
         )
 
+    def _emit_seeked(self, position_us):
+        """Emit the Seeked signal for a position jump (position in microseconds).
+
+        Position must not be sent through PropertiesChanged (MPRIS spec);
+        Seeked is how clients learn about discontinuities such as seeking or
+        starting another track.
+        """
+        self.__bus.emit_signal(
+            None,
+            self.__MPRIS_PATH,
+            self.__MPRIS_PLAYER_IFACE,
+            "Seeked",
+            GLib.Variant.new_tuple(GLib.Variant("x", int(position_us))),
+        )
+
     def Introspect(self):
         """Return the D-Bus introspection XML for this interface.
 
@@ -450,7 +423,6 @@ class MPRIS(Server):
 
         changed_properties = {
             "Metadata": GLib.Variant("a{sv}", self.__metadata),
-            "Position": GLib.Variant("x", self.player.query_position() / 1000),
             "CanGoNext": GLib.Variant("b", self.player.can_go_next),
             "CanGoPrevious": GLib.Variant("b", self.player.can_go_prev),
         }
