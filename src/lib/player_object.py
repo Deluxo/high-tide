@@ -199,6 +199,12 @@ class PlayerObject(GObject.GObject):
         # the ffmpeg process of the running cache download, so it can be
         # stopped on quit instead of being orphaned
         self._cache_process: subprocess.Popen | None = None
+        # download-then-play: a generation counter so a new track request
+        # cancels a running pre-download, and its download process, so it can be
+        # killed on cancellation or quit instead of being orphaned
+        self._download_gen: int = 0
+        self._download_process: subprocess.Popen | None = None
+        self._download_lock = threading.Lock()
 
         self._clean_stale_manifests()
 
@@ -600,6 +606,9 @@ class PlayerObject(GObject.GObject):
         self.stream = None
         self.manifest = None
 
+        # A new (non-gapless) track request cancels any running pre-download
+        gen = self._cancel_download() if not gapless else 0
+
         cached_music = self._cached_music_path(track)
         if cached_music:
             self._play_cached_track(track, cached_music, gapless)
@@ -609,6 +618,20 @@ class PlayerObject(GObject.GObject):
             self.stream = track.get_stream()
             self.manifest = self.stream.get_stream_manifest()
             urls = self.manifest.get_urls()
+
+            if not gapless:
+                # Download the full track into the music cache before playing,
+                # so playback reads from disk and doesn't depend on the CDN
+                # sustaining the stream bitrate (it throttles below lossless)
+                downloaded = self._download_track_to_cache(track, gen)
+                if self._download_gen != gen:
+                    # Cancelled by a newer track request
+                    return
+                if downloaded:
+                    cached_music = self._cached_music_path(track)
+                    if cached_music:
+                        self._play_cached_track(track, cached_music, gapless)
+                        return
 
             music_url = self._get_cached_or_stream_url(track, gapless)
 
@@ -711,6 +734,134 @@ class PlayerObject(GObject.GObject):
             return stream_url
 
         raise AttributeError(f"Unhandled manifest mime type: {self.stream.manifest_mime_type}")
+
+    def _cancel_download(self) -> int:
+        """Cancel any running pre-download. Returns the new generation."""
+        with self._download_lock:
+            self._download_gen += 1
+            proc = self._download_process
+            self._download_process = None
+        if proc:
+            proc.kill()
+        return self._download_gen
+
+    def _download_track_to_cache(self, track, gen) -> bool:
+        """Download a track fully into the music cache before playing it.
+
+        Playback then reads from disk, so it doesn't depend on the CDN
+        sustaining the stream bitrate (Fastly throttles below the lossless
+        bitrate). Returns True if the track is now in the cache.
+        """
+        # Stop the previous track so the download gets the full bandwidth, and
+        # show this track as loading
+        GLib.idle_add(self._show_downloading, track)
+        try:
+            if self.stream.manifest_mime_type == ManifestMimeType.MPD:
+                data = self.stream.get_manifest_data()
+                if not data:
+                    return False
+                mpd_path = Path(utils.CACHE_DIR, f"manifest_playback_{track.id}.mpd")
+                with open(mpd_path, "w") as f:
+                    f.write(data)
+                try:
+                    self._download_mpd(track, mpd_path, gen)
+                finally:
+                    mpd_path.unlink(missing_ok=True)
+            elif self.stream.manifest_mime_type == ManifestMimeType.BTS:
+                urls = self.manifest.get_urls()
+                stream_url = urls[0] if isinstance(urls, list) else urls
+                self._download_bts(track, stream_url, gen)
+            else:
+                return False
+        except Exception:
+            logger.exception(f"Error downloading track {track.id}")
+            return False
+        return self._cached_music_path(track) is not None
+
+    def _show_downloading(self, track) -> bool:
+        """Stop playback and show the track as loading (download-then-play).
+
+        Returns False so the GLib idle source isn't repeated.
+        """
+        # Stop without _maybe_start_cache, so a background cache download
+        # doesn't compete with the pre-download for bandwidth
+        self.playing = False
+        self.pipeline.set_state(Gst.State.NULL)
+        self.set_track(track)
+        self.emit("buffering", 0)
+        return False
+
+    def _download_mpd(self, track, mpd_path, gen) -> None:
+        """Download an MPD track into the music cache (blocking).
+
+        Cancels if a newer track was requested (gen changed).
+        """
+        cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
+        tmp = cached_music.with_suffix(".tmp")
+        proc = subprocess.Popen(
+            [
+                "ffmpeg",
+                # Leave the terminal alone when started from one: reading it from
+                # the sandbox's background process group stops the whole app
+                "-nostdin",
+                "-protocol_whitelist", "file,crypto,data,http,https,tcp,tls",
+                "-i", str(mpd_path),
+                "-f", "mp4",
+                "-c", "copy",
+                "-y", str(tmp)
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        with self._download_lock:
+            self._download_process = proc
+        try:
+            while proc.poll() is None:
+                if self._download_gen != gen:
+                    proc.kill()
+                    return
+                time.sleep(0.5)
+            stderr = proc.stderr.read()
+            proc.stderr.close()
+            if proc.returncode == 0:
+                tmp.rename(cached_music)
+                logger.info(f"Downloaded track for playback: {track.id}")
+            else:
+                logger.warning(
+                    f"ffmpeg download failed for {track.id}: "
+                    f"{stderr.decode(errors='replace')}"
+                )
+                tmp.unlink(missing_ok=True)
+        finally:
+            with self._download_lock:
+                self._download_process = None
+
+    def _download_bts(self, track, stream_url, gen) -> None:
+        """Download a BTS track into the music cache (blocking).
+
+        Cancels if a newer track was requested (gen changed).
+        """
+        import requests
+        cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
+        tmp = cached_music.with_suffix(".tmp")
+        try:
+            response = requests.get(stream_url, stream=True)
+            if response.status_code != 200:
+                logger.warning(
+                    f"Download failed for {track.id}: HTTP {response.status_code}"
+                )
+                return
+            with open(tmp, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if self._download_gen != gen:
+                        return
+                    f.write(chunk)
+            tmp.rename(cached_music)
+            logger.info(f"Downloaded track for playback: {track.id}")
+        except Exception:
+            logger.warning(f"Failed to download track {track.id}")
+            tmp.unlink(missing_ok=True)
 
     def _queue_cache(self, track) -> None:
         """Queue a track for caching.
@@ -896,11 +1047,12 @@ class PlayerObject(GObject.GObject):
             logger.exception("Error cleaning stale manifests")
 
     def shutdown(self) -> None:
-        """Stop the background cache download, if one is running.
+        """Stop any running downloads, if any are running.
 
-        The cache threads are daemon, so quitting the app would otherwise
+        The download threads are daemon, so quitting the app would otherwise
         leave ffmpeg running as an orphan.
         """
+        self._cancel_download()
         proc = self._cache_process
         if proc and proc.poll() is None:
             # If it was stopped while streaming, wake it so the terminate
