@@ -104,13 +104,27 @@ class PlayerObject(GObject.GObject):
         # the music cache
         self.current_uri = ""
 
+        # the armed next branch (uridecodebin, its branch queue, and the
+        # concat sink pad it's linked into), and its uri
+        self.next_uridecodebin: Any | None = None
+        self.next_branch_queue: Any | None = None
+        self._next_concat_sink: Any | None = None
+        self.next_uri = ""
+        # the next track's stream and manifest, applied when it starts
+        self.next_stream: Any | None = None
+        self.next_manifest: Any | None = None
+        # a next branch is being attached and prerolled on a worker thread
+        self._arming_next = False
+        # fires of concat's notify::active-pad, to suppress the first one
+        self._active_pad_fires = 0
+
         # Build the playback pipeline (see _build_pipeline)
         self._build_pipeline(preferred_sink)
 
-        # Gapless (a second decodebin branch on the concat) isn't attached
-        # yet, so tracks advance through the EOS handler
-        self.gapless_enabled = False
-        self.use_about_to_finish = True
+        # Gapless: the next track is a second uridecodebin branch on the
+        # concat, prerolled while the current track plays; at the boundary
+        # the concat's active pad switches to it (notify::active-pad)
+        self.gapless_enabled = preferred_sink != AudioSink.PIPEWIRE
 
         # Set up message bus
         self._bus = self.pipeline.get_bus()
@@ -165,15 +179,11 @@ class PlayerObject(GObject.GObject):
 
         # next track variables for gapless
         self.next_track: Any | None = None
-        # (track id, stream, manifest, fetch time) of the next track, fetched
-        # before the current one ends so its uri can be set in about-to-finish
-        self.prefetched: tuple | None = None
+        # id of the track whose stream is being prefetched, to avoid
+        # double-fetching
         self.prefetch_id: int | None = None
-        # track whose uri was set in about-to-finish from the prefetched stream
-        self.handed_off_track: Track | None = None
-        # a gapless track is being loaded / the current one ended before it was
+        # a gapless track is being loaded
         self.loading_gapless = False
-        self.reached_eos = False
         # the last track requested for gapless playback, dropped if another track
         # is played directly while it loads
         self.gapless_request: Track | None = None
@@ -237,6 +247,10 @@ class PlayerObject(GObject.GObject):
         a second branch can be attached for gapless playback later — with a
         single sink pad it's a passthrough.
         """
+        # Drop the armed next branch, if any: its elements are about to be
+        # removed from the pipeline along with everything else
+        self._detach_armed_next()
+
         for child in list(self.pipeline):
             self.pipeline.remove(child)
 
@@ -294,11 +308,18 @@ class PlayerObject(GObject.GObject):
             if not first.link(second):
                 logger.error(f"Failed to link {first} to {second}")
 
+        # The concat switches to a newly linked sink pad on the current one's
+        # EOS. Connect before requesting sink_0: gstconcat fires notify
+        # synchronously inside request_pad when there is no active pad yet,
+        # and the handler suppresses that first fire
+        self._active_pad_fires = 0
+        self.concat.connect("notify::active-pad", self._on_concat_active_pad)
+
         # Link the branch queue into the concat's first (and only) sink pad
-        concat_sink = self.concat.request_pad_simple("sink_%u")
+        self._current_concat_sink = self.concat.request_pad_simple("sink_%u")
         queue_src = self.branch_queue.get_static_pad("src")
-        if concat_sink and queue_src:
-            queue_src.link(concat_sink)
+        if self._current_concat_sink and queue_src:
+            queue_src.link(self._current_concat_sink)
 
         self.volume.set_property("volume", self._user_volume)
         if self.rgtags:
@@ -306,20 +327,28 @@ class PlayerObject(GObject.GObject):
 
         # uridecodebin creates its src pad when the source starts; link it
         # into the branch queue from the pad-added signal
-        self.uridecodebin.connect("pad-added", self._on_decodebin_pad_added)
+        self.uridecodebin.connect(
+            "pad-added",
+            lambda decodebin, src_pad: self._on_decodebin_pad_added(
+                decodebin, src_pad, self.branch_queue
+            ),
+        )
 
         # Restore the playing track's uri across a sink change
         if self.current_uri:
             self._set_uri(self.current_uri)
 
-    def _on_decodebin_pad_added(self, decodebin: Any, src_pad: Any) -> None:
-        """Link the decodebin's src pad into the branch queue.
+    def _on_decodebin_pad_added(
+        self, decodebin: Any, src_pad: Any, branch_queue: Any
+    ) -> None:
+        """Link the decodebin's src pad into its branch queue.
 
         Args:
             decodebin: required by Gst
             src_pad: the newly created src pad
+            branch_queue: the branch queue to link into
         """
-        sink_pad = self.branch_queue.get_static_pad("sink")
+        sink_pad = branch_queue.get_static_pad("sink")
         if sink_pad is None or sink_pad.is_linked():
             return
         # A decodebin can create a video pad too; only audio goes on
@@ -345,13 +374,197 @@ class PlayerObject(GObject.GObject):
         self.uridecodebin.set_property("uri", uri)
         self.current_uri = uri
 
+    def _detach_branch(
+        self, udb: Any, branch_queue: Any, concat_sink: Any
+    ) -> None:
+        """Detach a decodebin branch from the pipeline.
+
+        The branch queue's src is unlinked from the concat and the concat's
+        request pad is released BEFORE the branch goes NULL: the branch is
+        linked to a (possibly inactive) concat sink pad, which concat
+        hard-blocks, and nulling the branch while it's still linked would
+        hang the NULL transition on a live network source.
+        """
+        queue_src = branch_queue.get_static_pad("src")
+        if queue_src is not None and queue_src.is_linked():
+            queue_src.unlink()
+        self.concat.release_request_pad(concat_sink)
+        # Drive both to NULL and block until the transitions complete:
+        # removing an element still mid-transition disposes it in a non-NULL
+        # state
+        udb.set_state(Gst.State.NULL)
+        branch_queue.set_state(Gst.State.NULL)
+        udb.get_state(10 * Gst.SECOND)
+        branch_queue.get_state(10 * Gst.SECOND)
+        self.pipeline.remove(udb)
+        self.pipeline.remove(branch_queue)
+
+    def _detach_armed_next(self) -> None:
+        """Detach the armed next branch, if any, and clear its state."""
+        if self.next_uridecodebin is not None:
+            self._detach_branch(
+                self.next_uridecodebin,
+                self.next_branch_queue,
+                self._next_concat_sink,
+            )
+        self.next_uridecodebin = None
+        self.next_branch_queue = None
+        self._next_concat_sink = None
+        self.next_uri = ""
+        self.next_stream = None
+        self.next_manifest = None
+        self._arming_next = False
+
+    def _arm_next_track(
+        self, track: Track, stream: Any, manifest: Any, url: str
+    ) -> None:
+        """Attach the prefetched next track as a second branch on the concat.
+
+        Runs on the main thread; the attach and preroll block, so they run on
+        a worker thread that can't block the GLib main loop.
+        """
+        if self._arming_next or self.next_uridecodebin is not None:
+            return
+        if track is not self._peek_next_track():
+            logger.info(f"Not arming {track.id}: it's not the next track anymore")
+            return
+        self._arming_next = True
+        threading.Thread(
+            daemon=True,
+            target=self._arm_next_track_thread,
+            args=(track, stream, manifest, url),
+        ).start()
+
+    def _arm_next_track_thread(
+        self, track: Track, stream: Any, manifest: Any, url: str
+    ) -> None:
+        """Create and preroll the next branch (runs on a worker thread).
+
+        Like sone: preroll to PAUSED and block until the preroll settles, so
+        the decodebin's src pad is linked into the branch queue before any
+        buffer moves (going straight to PLAYING lets the demuxer push its
+        first buffer into an unlinked pad, `not-linked`), then promote to
+        PLAYING. The concat back-pressures the inactive sink pad, so the
+        branch holds prerolled and switches in gap-free at the EOS.
+        """
+        udb = Gst.ElementFactory.make("uridecodebin", None)
+        udb.set_property("uri", url)
+        # 15s of compressed buffer: the branch has the rest of the current
+        # track as lead time to fill it
+        udb.set_property("buffer-duration", 15 * Gst.SECOND)
+        udb.set_property("use-buffering", True)
+        branch_queue = Gst.ElementFactory.make("queue", None)
+        branch_queue.set_property("max-size-time", 15 * Gst.SECOND)
+        branch_queue.set_property("max-size-buffers", 0)
+        branch_queue.set_property("max-size-bytes", 0)
+
+        self.pipeline.add(udb)
+        self.pipeline.add(branch_queue)
+
+        # Link the branch queue into the concat's next sink pad (sink_1)
+        concat_sink = self.concat.request_pad_simple("sink_%u")
+        queue_src = branch_queue.get_static_pad("src")
+        if concat_sink is None or queue_src is None:
+            logger.error("Failed to request the concat's next sink pad")
+            self.pipeline.remove(udb)
+            self.pipeline.remove(branch_queue)
+            self._arming_next = False
+            return
+        queue_src.link(concat_sink)
+
+        # The decodebin's src pad links into the branch queue when it appears
+        udb.connect(
+            "pad-added",
+            lambda decodebin, src_pad: self._on_decodebin_pad_added(
+                decodebin, src_pad, branch_queue
+            ),
+        )
+
+        # Preroll to PAUSED and block until it settles (bounded, so a stalled
+        # network source can't hang this thread)
+        branch_queue.set_state(Gst.State.PAUSED)
+        udb.set_state(Gst.State.PAUSED)
+        udb.get_state(15 * Gst.SECOND)
+        # Preroll done + pad linked: promote to PLAYING
+        branch_queue.sync_state_with_parent()
+        udb.sync_state_with_parent()
+
+        # A directly played track detaches the armed branch; if that happened
+        # while the arm was in progress, drop what we just attached
+        if not self._arming_next:
+            self._detach_branch(udb, branch_queue, concat_sink)
+            return
+        self.next_uridecodebin = udb
+        self.next_branch_queue = branch_queue
+        self._next_concat_sink = concat_sink
+        self.next_uri = url
+        self.next_stream = stream
+        self.next_manifest = manifest
+        self.next_track = track
+        self._arming_next = False
+        logger.info(f"Armed next track for gapless: {track.id}")
+
+    def _on_concat_active_pad(self, concat: Any, param_spec: Any) -> None:
+        """The concat switched its active sink pad.
+
+        The first fire is the initial link of sink_0 (suppressed). A switch to
+        the armed next branch's pad is a gapless advance; a switch to None is
+        the terminal EOS, handled by the pipeline's bus EOS message.
+        """
+        self._active_pad_fires += 1
+        if self._active_pad_fires == 1:
+            return
+        active_pad = self.concat.get_property("active-pad")
+        if active_pad is None:
+            return
+        # Only advance when the active pad is the armed next branch's
+        peer = active_pad.get_peer()
+        if peer is not None and peer.get_parent() is self.next_branch_queue:
+            GLib.idle_add(self._on_gapless_advance)
+
+    def _on_gapless_advance(self) -> None:
+        """The concat switched to the armed next branch: make it current."""
+        if self.next_uridecodebin is None:
+            return
+        # The old branch, to detach on a worker thread (the detach blocks on
+        # the NULL transition); the armed branch is promoted immediately so
+        # the main thread never sees a half-detached element
+        old = (self.uridecodebin, self.branch_queue, self._current_concat_sink)
+        self.uridecodebin = self.next_uridecodebin
+        self.branch_queue = self.next_branch_queue
+        self._current_concat_sink = self._next_concat_sink
+        self.current_uri = self.next_uri
+        self.stream = self.next_stream
+        self.manifest = self.next_manifest
+        playing_track = self.playing_track
+        self.next_uridecodebin = None
+        self.next_branch_queue = None
+        self._next_concat_sink = None
+        self.next_uri = ""
+        self.next_stream = None
+        self.next_manifest = None
+        self._arming_next = False
+
+        def detach_old():
+            self._detach_branch(*old)
+            GLib.idle_add(self._gapless_track_started, playing_track)
+
+        threading.Thread(daemon=True, target=detach_old).start()
+
+    def _gapless_track_started(self, playing_track) -> None:
+        """Update the UI once the old branch is fully detached."""
+        # Record the finished track
+        if playing_track is not None:
+            self.played_songs.append(playing_track)
+        # self.next_track is the armed track; set_track() picks it up
+        self._track_started()
+
     def change_audio_sink(self, sink_type: AudioSink) -> None:
         """Change the audio sink while maintaining playback state.
 
         Args:
             sink_type (int): The audio sink `AudioSink` enum
         """
-        self.use_about_to_finish = False
         # Play the same track again after reload
         self.next_track = self.playing_track
         was_playing: bool = self.playing
@@ -364,7 +577,6 @@ class PlayerObject(GObject.GObject):
         if was_playing and duration != 0:
             self.pipeline.set_state(Gst.State.PLAYING)
             self.seek_after_sink_reload = position / duration
-        self.use_about_to_finish = True
 
     def _on_bus_eos(self, *args) -> None:
         """Handle end of stream: play the next track (or stop at the end)."""
@@ -469,6 +681,15 @@ class PlayerObject(GObject.GObject):
             bus: required by Gst
             message: required by Gst
         """
+        # The armed next branch's source fires stream-start during its
+        # preroll; that track becomes current on the gapless advance, which
+        # updates the UI then
+        if self._arming_next:
+            return
+        self._track_started()
+
+    def _track_started(self) -> None:
+        """A track has started playing: update the UI and do housekeeping."""
         # apply replaygain first to avoid volume clipping
         # (Idk if that will happen but its the only thing that has effect on audio in here)
         if self.stream:
@@ -625,12 +846,6 @@ class PlayerObject(GObject.GObject):
             track: The Track object to play
             gapless: Whether to enqueue the track for gapless playback
         """
-        handed_off_track = self.handed_off_track
-        self.handed_off_track = None
-        if gapless and track is handed_off_track:
-            # The next track is already attached and playing into the concat
-            self.next_track = track
-            return
         if gapless:
             self.gapless_request = track
             self.loading_gapless = True
@@ -713,15 +928,15 @@ class PlayerObject(GObject.GObject):
             logger.info(f"Playing from music cache: {track.id}")
             return f"file://{cached_music}"
 
-        return self._get_stream_url(track, gapless)
+        return self._get_stream_url(track, self.stream, self.manifest, gapless)
 
-    def _get_stream_url(self, track, gapless=False):
-        """Get stream URL and queue the track for caching."""
+    def _get_stream_url(self, track, stream, manifest, gapless=False):
+        """Get the stream URL and queue the track for caching."""
         if not gapless:
             self.apply_replaygain_tags()
 
-        if self.stream.manifest_mime_type == ManifestMimeType.MPD:
-            data = self.stream.get_manifest_data()
+        if stream.manifest_mime_type == ManifestMimeType.MPD:
+            data = stream.get_manifest_data()
             if not data:
                 raise AttributeError("No MPD manifest available!")
             # The manifest is embedded in the uri (a self-contained data: URI,
@@ -734,15 +949,17 @@ class PlayerObject(GObject.GObject):
             self._queue_cache(track)
             return "data:application/dash+xml;base64," + mpd_b64
 
-        elif self.stream.manifest_mime_type == ManifestMimeType.BTS:
-            urls = self.manifest.get_urls()
+        elif stream.manifest_mime_type == ManifestMimeType.BTS:
+            urls = manifest.get_urls()
             stream_url = urls[0] if isinstance(urls, list) else urls
 
             self._queue_cache(track)
 
             return stream_url
 
-        raise AttributeError(f"Unhandled manifest mime type: {self.stream.manifest_mime_type}")
+        raise AttributeError(
+            f"Unhandled manifest mime type: {stream.manifest_mime_type}"
+        )
 
     def _queue_cache(self, track) -> None:
         """Queue a track for caching.
@@ -983,37 +1200,32 @@ class PlayerObject(GObject.GObject):
                 return
             self.gapless_request = None
             self.loading_gapless = False
-            if self.reached_eos:
-                # Too late for gapless, the previous track already ended
-                gapless = False
-        if not gapless:
-            # A track played directly replaces the one queued for gapless playback,
-            # which would otherwise be shown as playing when this one starts
-            self.gapless_request = None
-            self.next_track = None
-            self.reached_eos = False
-            self.use_about_to_finish = False
-            self.pipeline.set_state(Gst.State.NULL)
+        if gapless:
+            # Arm the next branch on the concat; the current track keeps
+            # playing and the concat switches to it at its EOS
+            self._arm_next_track(track, self.stream, self.manifest, music_url)
+            return
+        # A track played directly replaces the one queued for gapless playback,
+        # which would otherwise be shown as playing when this one starts
+        self.gapless_request = None
+        self.next_track = None
+        self.pipeline.set_state(Gst.State.NULL)
+        # A directly played track replaces the armed next branch
+        self._detach_armed_next()
         self._set_uri(music_url)
 
         logger.info(music_url)
 
-        if gapless:
-            self.next_track = track
-        else:
-            self.set_track(track)
-            self.stream_loaded_at = time.time()
-            # A fresh stream starts downloading from an empty buffer
-            self.last_buffer_per = -1
-            now = time.monotonic()
-            self.buffer_grew_since = now
-            self.stream_load_started = now
+        self.set_track(track)
+        self.stream_loaded_at = time.time()
+        # A fresh stream starts downloading from an empty buffer
+        self.last_buffer_per = -1
+        now = time.monotonic()
+        self.buffer_grew_since = now
+        self.stream_load_started = now
 
-        if not gapless and self.playing:
+        if self.playing:
             self.play()
-
-        if not gapless:
-            self.use_about_to_finish = True
 
     def _peek_next_track(self) -> Track | None:
         """Get the track play_next(gapless=True) would play, without removing it"""
@@ -1029,7 +1241,7 @@ class PlayerObject(GObject.GObject):
 
     def _prefetch_next_track(self) -> None:
         """Fetch the stream of the next track in the background"""
-        if self.next_track or self.handed_off_track or self.loading_gapless:
+        if self.next_track or self.loading_gapless:
             return
         if not self.tracks_to_play:
             return
@@ -1047,8 +1259,11 @@ class PlayerObject(GObject.GObject):
         try:
             stream = track.get_stream()
             manifest = stream.get_stream_manifest()
-            self.prefetched = (track.id, stream, manifest, GLib.get_monotonic_time())
             logger.info(f"Prefetched stream: {track.id}")
+            # Arm the next branch on the concat, so the track is prerolled
+            # and can start gap-free when the current one ends
+            url = self._get_stream_url(track, stream, manifest, gapless=True)
+            GLib.idle_add(self._arm_next_track, track, stream, manifest, url)
         except Exception:
             logger.exception("Error prefetching track stream")
 
@@ -1254,8 +1469,11 @@ class PlayerObject(GObject.GObject):
             self.position_stuck_since = now
             self.stream_reconnects = 0
             return
-        # During a gapless change the next track is loading
-        if now - self.position_stuck_since < 3 or self.next_track:
+        # The position doesn't freeze during a gapless change (the concat
+        # switches seamlessly), so the safety net stays active while the
+        # next track is armed — including the last 30s, where a dead
+        # connection would otherwise stall the current track forever
+        if now - self.position_stuck_since < 3:
             return
         uri = self.current_uri
         cached_music = self._cached_music_path(self.playing_track)
@@ -1332,7 +1550,6 @@ class PlayerObject(GObject.GObject):
         # If a seek close to the end is performed then skip
         # Avoids UI desync and stuck tracks
         if not self.seeked_to_end and seek_fraction > 0.98:
-            self.use_about_to_finish = False
             self.seeked_to_end = True
             self.play_next()
             return
