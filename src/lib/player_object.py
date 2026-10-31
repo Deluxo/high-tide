@@ -159,6 +159,15 @@ class PlayerObject(GObject.GObject):
         # how many times a stuck stream has been reconnected (reset on progress)
         self.stream_reconnects: int = 0
         self.MAX_STREAM_RECONNECTS: int = 5
+        # the last observed buffering level and when it last grew, to tell a slow
+        # download (buffer growing, leave it alone) from a dead connection
+        self.last_buffer_per: int = -1
+        self.buffer_grew_since: float = 0.0
+        self.BUFFER_DEAD_FOR: float = 30.0
+        # a stream that hasn't started playing within this long is too slow;
+        # reconnect to try a faster edge instead of buffering forever
+        self.MAX_STREAM_LOAD: float = 60.0
+        self.stream_load_started: float = 0.0
         # where the last seek went, as the position can't be queried until it's done
         self.last_seek_position: int | None = None
 
@@ -374,6 +383,11 @@ class PlayerObject(GObject.GObject):
     def _on_buffering_message(self, bus: Any, message: Any) -> None:
         buffer_per: int = message.parse_buffering()
         mode, avg_in, avg_out, buff_left = message.parse_buffering_stats()
+
+        if buffer_per > self.last_buffer_per:
+            # Data is arriving; a download is in progress
+            self.buffer_grew_since = time.monotonic()
+        self.last_buffer_per = buffer_per
 
         self.emit("buffering", buffer_per)
 
@@ -962,6 +976,11 @@ class PlayerObject(GObject.GObject):
         else:
             self.set_track(track)
             self.stream_loaded_at = time.time()
+            # A fresh stream starts downloading from an empty buffer
+            self.last_buffer_per = -1
+            now = time.monotonic()
+            self.buffer_grew_since = now
+            self.stream_load_started = now
 
         if not gapless and self.playing:
             self.play()
@@ -1239,7 +1258,8 @@ class PlayerObject(GObject.GObject):
         """Recover when the stream of the playing track is stuck.
 
         Continue from the music cache if the track is cached (e.g. the internet
-        went out). Otherwise reconnect: re-fetch the stream for a fresh set of
+        went out). Otherwise, if the buffer stopped growing (a dead connection,
+        not a slow download), reconnect: re-fetch the stream for a fresh set of
         urls and a fresh connection to the CDN, which may land on a faster edge.
         """
         position = self.query_position(-1)
@@ -1270,6 +1290,18 @@ class PlayerObject(GObject.GObject):
         # can be re-fetched.
         if uri.startswith("file://") and not uri.endswith(".mpd"):
             return
+        # A frozen position also happens while a slow download is still filling
+        # the buffer, and a reconnect discards that buffer. Only reconnect when
+        # the buffer stopped growing (dead connection), or, during the initial
+        # load, when it's taking so long that a fresh edge is worth a try.
+        buffer_dead = now - self.buffer_grew_since >= self.BUFFER_DEAD_FOR
+        load_too_long = (
+            position <= 0
+            and self.stream_load_started
+            and now - self.stream_load_started >= self.MAX_STREAM_LOAD
+        )
+        if not buffer_dead and not load_too_long:
+            return
         if self.stream_reconnects >= self.MAX_STREAM_RECONNECTS:
             # Gave up; don't retry on every timer tick
             self.position_stuck_since = now
@@ -1277,7 +1309,7 @@ class PlayerObject(GObject.GObject):
         self.stream_reconnects += 1
         self.position_stuck_since = now
         logger.warning(
-            f"Stream stuck, reconnecting "
+            f"Stream stuck, buffer dead, reconnecting "
             f"({self.stream_reconnects}/{self.MAX_STREAM_RECONNECTS})"
         )
         self._reload_track()
