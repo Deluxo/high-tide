@@ -112,6 +112,7 @@ class HTPlaylistPage(TrackListPage):
         def on_save(dialog, title, description):
             dialog.close()
             threading.Thread(
+                daemon=True,
                 target=utils.th_edit_playlist,
                 args=(self.item, title, description, self._on_playlist_changed),
             ).start()
@@ -121,6 +122,7 @@ class HTPlaylistPage(TrackListPage):
 
     def _on_toggle_public(self, *args):
         threading.Thread(
+            daemon=True,
             target=utils.th_set_playlist_public,
             args=(self.item, not self.item.public, self._on_playlist_changed),
         ).start()
@@ -146,6 +148,7 @@ class HTPlaylistPage(TrackListPage):
             if response != "delete":
                 return
             threading.Thread(
+                daemon=True,
                 target=utils.th_delete_playlist,
                 args=(self.item, self._on_deleted),
             ).start()

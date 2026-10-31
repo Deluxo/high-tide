@@ -536,7 +536,11 @@ class PlayerObject(GObject.GObject):
         if gapless:
             self.gapless_request = track
             self.loading_gapless = True
-        threading.Thread(target=self._play_track_thread, args=(track, gapless)).start()
+        threading.Thread(
+            daemon=True,
+            target=self._play_track_thread,
+            args=(track, gapless),
+        ).start()
 
     def _play_track_thread(self, track: Track, gapless=False) -> None:
         self.stream = None
@@ -633,6 +637,7 @@ class PlayerObject(GObject.GObject):
 
                 if not self.monitor.get_network_metered():
                     threading.Thread(
+                        daemon=True,
                         target=self._cache_mpd_track,
                         args=(track, mpd_path)
                     ).start()
@@ -652,6 +657,7 @@ class PlayerObject(GObject.GObject):
 
             if not self.monitor.get_network_metered():
                 threading.Thread(
+                    daemon=True,
                     target=self._cache_bts_track,
                     args=(track, stream_url)
                 ).start()
@@ -821,7 +827,11 @@ class PlayerObject(GObject.GObject):
         if not track or track.id == self.prefetch_id:
             return
         self.prefetch_id = track.id
-        threading.Thread(target=self._prefetch_thread, args=(track,)).start()
+        threading.Thread(
+            daemon=True,
+            target=self._prefetch_thread,
+            args=(track,),
+        ).start()
 
     def _prefetch_thread(self, track: Track) -> None:
         try:

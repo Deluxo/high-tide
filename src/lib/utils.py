@@ -655,7 +655,7 @@ def toggle_blocked(item: Any, callback: Any = None) -> None:
         callback: Called on the main thread with the new blocked state
     """
     target = th_unblock if is_blocked(item) else th_block
-    threading.Thread(target=target, args=(item, callback)).start()
+    threading.Thread(daemon=True, target=target, args=(item, callback)).start()
 
 
 def send_toast(toast_title: str, timeout: int) -> None:
@@ -733,9 +733,17 @@ def on_in_to_my_collection_button_clicked(btn: Any, item: Any) -> None:
         item: The TIDAL item to add or remove from favorites
     """
     if btn.get_icon_name() == "heart-outline-thick-symbolic":
-        threading.Thread(target=th_add_to_my_collection, args=(btn, item)).start()
+        threading.Thread(
+            daemon=True,
+            target=th_add_to_my_collection,
+            args=(btn, item),
+        ).start()
     else:
-        threading.Thread(target=th_remove_from_my_collection, args=(btn, item)).start()
+        threading.Thread(
+            daemon=True,
+            target=th_remove_from_my_collection,
+            args=(btn, item),
+        ).start()
 
 
 def is_own_playlist(playlist: Any) -> bool:
@@ -841,6 +849,7 @@ def new_playlist(track: Track | None = None) -> None:
     def on_create(dialog, title, description):
         dialog.close()
         threading.Thread(
+            daemon=True,
             target=th_create_playlist, args=(title, description, track)
         ).start()
 
@@ -1074,7 +1083,11 @@ def open_tidal_uri(uri: str) -> None:
                 lambda: HTAlbumPage.new_from_id(content_id).load(),
             )
         case "track":
-            threading.Thread(target=th_play_track, args=(content_id,)).start()
+            threading.Thread(
+                daemon=True,
+                target=th_play_track,
+                args=(content_id,),
+            ).start()
         case "mix":
             push_page(f"mix-{content_id}", lambda: HTMixPage(content_id).load())
         case "playlist":

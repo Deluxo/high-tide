@@ -167,6 +167,7 @@ class HTArtistPage(Page):
         artist_picture = builder.get_object("_avatar")
 
         threading.Thread(
+            daemon=True,
             target=utils.add_image_to_avatar, args=(artist_picture, self.artist)
         ).start()
 

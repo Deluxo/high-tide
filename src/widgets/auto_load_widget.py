@@ -161,7 +161,7 @@ class HTAutoLoadWidget(Gtk.Box, IDisconnectable):
     def _on_edge_reached(self, scrolled_window, pos):
         GObject.signal_handler_block(self.scrolled_window, self.handler_id)
         if pos == Gtk.PositionType.BOTTOM:
-            threading.Thread(target=self.th_load_items).start()
+            threading.Thread(daemon=True, target=self.th_load_items).start()
         GObject.signal_handler_unblock(self.scrolled_window, self.handler_id)
 
     def _add_tracks(self, new_items):

@@ -233,7 +233,7 @@ class HighTideWindow(Adw.ApplicationWindow):
 
         try:
             self.secret_store = SecretStore(self.session)
-            threading.Thread(target=self.th_login, args=()).start()
+            threading.Thread(daemon=True, target=self.th_login, args=()).start()
         except Exception:
             self.secret_portal_dialog.present(self)
             return
@@ -245,7 +245,11 @@ class HighTideWindow(Adw.ApplicationWindow):
 
         self.connect("notify::is-active", self.stop_video_in_background)
 
-        threading.Thread(target=utils.evict_cache, args=(utils.MUSIC_DIR, 5)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.evict_cache,
+            args=(utils.MUSIC_DIR, 5),
+        ).start()
 
     @Gtk.Template.Callback("copy_secret_service_override_command")
     def copy_secret_service_override_command (self, *args):
@@ -312,8 +316,12 @@ class HighTideWindow(Adw.ApplicationWindow):
         self.player_lyrics_queue.set_sensitive(True)
         self.navigation_buttons.set_sensitive(True)
 
-        threading.Thread(target=self.th_set_last_playing_song, args=()).start()
-        threading.Thread(target=utils.get_blocked, args=()).start()
+        threading.Thread(
+            daemon=True,
+            target=self.th_set_last_playing_song,
+            args=(),
+        ).start()
+        threading.Thread(daemon=True, target=utils.get_blocked, args=()).start()
 
         self.is_logged_in = True
 
@@ -405,6 +413,7 @@ class HighTideWindow(Adw.ApplicationWindow):
 
         if self.video_covers_enabled and album.video_cover:
             threading.Thread(
+                daemon=True,
                 target=utils.add_video_cover,
                 args=(
                     self.playing_track_picture,
@@ -417,15 +426,21 @@ class HighTideWindow(Adw.ApplicationWindow):
             ).start()
         else:
             threading.Thread(
+                daemon=True,
                 target=utils.add_picture,
                 args=(self.playing_track_picture, album, dimensions, self.image_canc),
             ).start()
 
         threading.Thread(
+            daemon=True,
             target=utils.add_image, args=(self.playing_track_image, album)
         ).start()
 
-        threading.Thread(target=self.th_add_lyrics_to_page, args=()).start()
+        threading.Thread(
+            daemon=True,
+            target=self.th_add_lyrics_to_page,
+            args=(),
+        ).start()
 
         self.control_bar_artist = track.artist
         self.update_slider()
@@ -814,6 +829,7 @@ class HighTideWindow(Adw.ApplicationWindow):
 
             if self.video_covers_enabled and album.video_cover:
                 threading.Thread(
+                    daemon=True,
                     target=utils.add_video_cover,
                     args=(
                         self.playing_track_picture,
@@ -826,6 +842,7 @@ class HighTideWindow(Adw.ApplicationWindow):
                 ).start()
             else:
                 threading.Thread(
+                    daemon=True,
                     target=utils.add_picture,
                     args=(
                         self.playing_track_picture,

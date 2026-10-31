@@ -137,7 +137,7 @@ class HTActivityPage(Page):
                 activity = {}
             GLib.idle_add(self._set_activity, activity)
 
-        threading.Thread(target=_load).start()
+        threading.Thread(daemon=True, target=_load).start()
 
     def _set_activity(self, activity: dict) -> None:
         self.activity = activity
@@ -189,6 +189,7 @@ class HTActivityPage(Page):
             row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
 
             threading.Thread(
+                daemon=True,
                 target=utils.add_image_to_avatar, args=(avatar, artist)
             ).start()
 

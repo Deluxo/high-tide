@@ -106,6 +106,7 @@ class HTTopHitWidget(Gtk.Box, IDisconnectable):
         )
 
         threading.Thread(
+            daemon=True,
             target=utils.add_image, args=(self.image, self.item.album)
         ).start()
 
@@ -134,7 +135,11 @@ class HTTopHitWidget(Gtk.Box, IDisconnectable):
             )
         )
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_album(self) -> None:
         self.primary_label.set_label(self.item.name)
@@ -161,7 +166,11 @@ class HTTopHitWidget(Gtk.Box, IDisconnectable):
             )
         )
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_playlist(self) -> None:
         self.primary_label.set_label(self.item.name)
@@ -189,7 +198,11 @@ class HTTopHitWidget(Gtk.Box, IDisconnectable):
             )
         )
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_artist(self) -> None:
         self.primary_label.set_label(self.item.name)
@@ -198,4 +211,8 @@ class HTTopHitWidget(Gtk.Box, IDisconnectable):
         self.play_button.set_visible(False)
         self.shuffle_button.set_visible(False)
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()

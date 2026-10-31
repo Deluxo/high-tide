@@ -125,6 +125,7 @@ class HTGenericTrackWidget(Gtk.ListBoxRow, IDisconnectable):
         ))
 
         threading.Thread(
+            daemon=True,
             target=utils.add_image, args=(self.image, self.track.album)
         ).start()
 
@@ -269,6 +270,7 @@ class HTGenericTrackWidget(Gtk.ListBoxRow, IDisconnectable):
 
     def _remove_from_playlist(self, *args):
         threading.Thread(
+            daemon=True,
             target=utils.th_remove_from_playlist,
             args=(
                 self.playlist,
@@ -310,7 +312,11 @@ class HTGenericTrackWidget(Gtk.ListBoxRow, IDisconnectable):
         utils.player_object.add_to_queue(self.track)
 
     def _th_add_to_my_collection(self, *args):
-        threading.Thread(target=self.th_add_to_my_collection, args=()).start()
+        threading.Thread(
+            daemon=True,
+            target=self.th_add_to_my_collection,
+            args=(),
+        ).start()
 
     def th_add_to_my_collection(self):
         utils.session.user.favorites.add_track(self.track.id)
@@ -319,6 +325,7 @@ class HTGenericTrackWidget(Gtk.ListBoxRow, IDisconnectable):
         self.menu_button.popdown()
 
         threading.Thread(
+            daemon=True,
             target=utils.th_add_to_playlist, args=(playlist, self.track)
         ).start()
 

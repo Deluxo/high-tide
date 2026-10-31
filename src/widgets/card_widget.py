@@ -140,6 +140,7 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
         self.detail_label.set_visible(False)
 
         threading.Thread(
+            daemon=True,
             target=utils.add_image, args=(self.image, self.item.album)
         ).start()
 
@@ -150,7 +151,11 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
         self.detail_label.set_label(self.item.sub_title)
         self.track_artist_label.set_visible(False)
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_album_card(self) -> None:
         """Configure the card to display an Album item"""
@@ -159,7 +164,11 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
         self.track_artist_label.set_artists(self.item.artists)
         self.detail_label.set_visible(False)
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_playlist_card(self) -> None:
         """Configure the card to display a Playlist item"""
@@ -172,7 +181,11 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
             creator_name = self.item.creator.name
         self.detail_label.set_label(_("By {}").format(creator_name))
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_artist_card(self) -> None:
         """Configure the card to display an Artist item"""
@@ -181,7 +194,11 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
         self.detail_label.set_label(_("Artist"))
         self.track_artist_label.set_visible(False)
 
-        threading.Thread(target=utils.add_image, args=(self.image, self.item)).start()
+        threading.Thread(
+            daemon=True,
+            target=utils.add_image,
+            args=(self.image, self.item),
+        ).start()
 
     def _make_page_item_card(self) -> None:
         """Configure the card to display a PageItem"""
@@ -198,7 +215,7 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
 
             GLib.idle_add(self._populate)
 
-        threading.Thread(target=_get_item).start()
+        threading.Thread(daemon=True, target=_get_item).start()
 
     def _on_enter(self, *args) -> None:
         self.play_revealer.set_reveal_child(True)
@@ -234,7 +251,7 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
             if tracks:
                 utils.player_object.play_this(item, 0, tracks)
 
-        threading.Thread(target=th_get_tracks).start()
+        threading.Thread(daemon=True, target=th_get_tracks).start()
 
     def _on_click(self, *args) -> None:
         """Handle click events on the card.
@@ -251,4 +268,4 @@ class HTCardWidget(Adw.BreakpointBin, IDisconnectable):
             def _get():
                 GLib.idle_add(utils.player_object.play_this, self.item.get())
 
-            threading.Thread(target=_get).start()
+            threading.Thread(daemon=True, target=_get).start()
