@@ -631,6 +631,9 @@ class PlayerObject(GObject.GObject):
                     cached_music = self._cached_music_path(track)
                     if cached_music:
                         self._play_cached_track(track, cached_music, gapless)
+                        # A local file doesn't post "buffering" bus messages, so
+                        # hide the download spinner explicitly
+                        GLib.idle_add(lambda: self.emit("buffering", 100))
                         return
 
             music_url = self._get_cached_or_stream_url(track, gapless)
