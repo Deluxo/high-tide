@@ -156,6 +156,9 @@ class PlayerObject(GObject.GObject):
         # to notice when the stream of the playing track gets stuck
         self.last_position: int | None = None
         self.position_stuck_since: float = 0.0
+        # how many times a stuck stream has been reconnected (reset on progress)
+        self.stream_reconnects: int = 0
+        self.MAX_STREAM_RECONNECTS: int = 5
         # where the last seek went, as the position can't be queried until it's done
         self.last_seek_position: int | None = None
 
@@ -1233,33 +1236,51 @@ class PlayerObject(GObject.GObject):
         return self.playing
 
     def _check_stream_stuck(self) -> None:
-        """Continue from the music cache if the stream of the playing track is stuck.
+        """Recover when the stream of the playing track is stuck.
 
-        E.g. the internet went out: the track may have been cached in the meantime.
+        Continue from the music cache if the track is cached (e.g. the internet
+        went out). Otherwise reconnect: re-fetch the stream for a fresh set of
+        urls and a fresh connection to the CDN, which may land on a faster edge.
         """
         position = self.query_position(-1)
         now = time.monotonic()
         if not self.playing or position != self.last_position:
             self.last_position = position
             self.position_stuck_since = now
+            self.stream_reconnects = 0
             return
         # During a gapless change the next track is loading
         if now - self.position_stuck_since < 3 or self.next_track:
             return
-        cached_music = self._cached_music_path(self.playing_track)
         uri = self.playbin.get_property("current-uri") or ""
-        if not cached_music or uri == f"file://{cached_music}":
+        cached_music = self._cached_music_path(self.playing_track)
+        if cached_music and uri != f"file://{cached_music}":
+            self.position_stuck_since = now
+            self.stream_reconnects = 0
+            if position <= 0 and self.last_seek_position is not None:
+                # Stuck right after a seek, before anything could be downloaded
+                position = self.last_seek_position
+            duration = self.query_duration()
+            if duration and position > 0:
+                self.seek_after_sink_reload = position / duration
+            logger.warning("Stream stuck, continuing from the music cache")
+            self._play_track_url(self.playing_track, f"file://{cached_music}")
             return
-
+        # A plain local file has nothing to reconnect; only a network stream (.mpd)
+        # can be re-fetched.
+        if uri.startswith("file://") and not uri.endswith(".mpd"):
+            return
+        if self.stream_reconnects >= self.MAX_STREAM_RECONNECTS:
+            # Gave up; don't retry on every timer tick
+            self.position_stuck_since = now
+            return
+        self.stream_reconnects += 1
         self.position_stuck_since = now
-        if position <= 0 and self.last_seek_position is not None:
-            # Stuck right after a seek, before anything could be downloaded
-            position = self.last_seek_position
-        duration = self.query_duration()
-        if duration and position > 0:
-            self.seek_after_sink_reload = position / duration
-        logger.warning("Stream stuck, continuing from the music cache")
-        self._play_track_url(self.playing_track, f"file://{cached_music}")
+        logger.warning(
+            f"Stream stuck, reconnecting "
+            f"({self.stream_reconnects}/{self.MAX_STREAM_RECONNECTS})"
+        )
+        self._reload_track()
 
     def query_duration(self):
         """Get the duration of the current track.
