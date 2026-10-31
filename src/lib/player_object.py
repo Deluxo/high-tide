@@ -18,7 +18,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import logging
+import os
 import random
+import signal
+import subprocess
 import threading
 import time
 import base64
@@ -104,6 +107,9 @@ class PlayerObject(GObject.GObject):
 
         self.pipeline.add(self.playbin)
 
+        # Configure the pipeline elements that playbin3 creates
+        self.playbin.connect("element-setup", self._on_element_setup)
+
         self.normalize = normalize
         self.quadratic_volume = quadratic_volume
         self.most_recent_rg_tags = ""
@@ -171,6 +177,19 @@ class PlayerObject(GObject.GObject):
         # for not caching on metered networks
         self.monitor = Gio.NetworkMonitor.get_default()
 
+        # music cache: tracks get queued as they play, and the download only
+        # runs while playback isn't using the network, so it doesn't starve
+        # the stream of bandwidth
+        self._cache_queue: List[Track] = []
+        self._cache_queued_ids: set = set()
+        self._cache_thread: threading.Thread | None = None
+        self._cache_lock = threading.Lock()
+        # the ffmpeg process of the running cache download, so it can be
+        # stopped on quit instead of being orphaned
+        self._cache_process: subprocess.Popen | None = None
+
+        self._clean_stale_manifests()
+
     @GObject.Property(type=bool, default=False)
     def playing(self) -> bool:
         return self._playing
@@ -226,8 +245,13 @@ class PlayerObject(GObject.GObject):
                 f"rglimiter ! audioconvert !"
             )
 
+        # Keep a large decoded-audio buffer so short network stalls don't stop
+        # playback. The queue defaults to one second, which is far too little
+        # for hi-res streams.
+        buffer_ns = 30 * Gst.SECOND
         pipeline_str = (
-            f"queue ! audioconvert ! {normalization} audioresample ! {sink_name}"
+            f"queue max-size-buffers=0 max-size-bytes=0 max-size-time={buffer_ns} ! "
+            f"audioconvert ! {normalization} audioresample ! {sink_name}"
         )
 
         if sink_type == AudioSink.PIPEWIRE:
@@ -246,6 +270,13 @@ class PlayerObject(GObject.GObject):
             self.playbin.set_property(
                 "audio-sink", Gst.ElementFactory.make("autoaudiosink", None)
             )
+
+    def _on_element_setup(self, playbin: Any, element: Any) -> None:
+        """Configure the elements that playbin3 creates for the pipeline."""
+        # Buffer DASH fragments further ahead than the default 30 seconds, so
+        # a slow segment doesn't stall playback
+        if element.find_property("max-buffering-time"):
+            element.set_property("max-buffering-time", 60)
 
     def change_audio_sink(self, sink_type: AudioSink) -> None:
         """Change the audio sink while maintaining playback state.
@@ -384,6 +415,9 @@ class PlayerObject(GObject.GObject):
         self.set_track()
         self.stream_loaded_at = time.time()
 
+        # Cache the track in the background, when it's safe to do so
+        self._queue_cache(self.playing_track)
+
         if self.discord_rpc_enabled and self.playing_track:
             discord_rpc.set_activity(self.playing_track, 0)
 
@@ -510,6 +544,9 @@ class PlayerObject(GObject.GObject):
         self.playing = False
         self.pipeline.set_state(Gst.State.PAUSED)
 
+        # Caching can now use the network
+        self._maybe_start_cache()
+
         if self.discord_rpc_enabled:
             discord_rpc.set_activity()
 
@@ -619,7 +656,7 @@ class PlayerObject(GObject.GObject):
         return self._get_stream_url(track, gapless)
 
     def _get_stream_url(self, track, gapless=False):
-        """Get stream URL and start background caching."""
+        """Get stream URL and queue the track for caching."""
         if not gapless:
             self.apply_replaygain_tags()
 
@@ -630,17 +667,13 @@ class PlayerObject(GObject.GObject):
 
             major, minor, micro, nano = Gst.version()
             if (major, minor) >= (1, 26):
-                # Write manifest to temp location for GStreamer and caching
-                mpd_path = Path(utils.CACHE_DIR, "manifest.mpd")
+                # Write the manifest to a per-track file for GStreamer, so a
+                # prefetched track can't overwrite the one that's playing
+                mpd_path = Path(utils.CACHE_DIR, f"manifest_playback_{track.id}.mpd")
                 with open(mpd_path, "w") as f:
                     f.write(data)
 
-                if not self.monitor.get_network_metered():
-                    threading.Thread(
-                        daemon=True,
-                        target=self._cache_mpd_track,
-                        args=(track, mpd_path)
-                    ).start()
+                self._queue_cache(track)
 
                 return f"file://{mpd_path}"
             else:
@@ -649,32 +682,109 @@ class PlayerObject(GObject.GObject):
                 else:
                     mpd_bytes = data
                 mpd_b64 = base64.b64encode(mpd_bytes).decode("ascii")
+                self._queue_cache(track)
                 return "data:application/dash+xml;base64," + mpd_b64
 
         elif self.stream.manifest_mime_type == ManifestMimeType.BTS:
             urls = self.manifest.get_urls()
             stream_url = urls[0] if isinstance(urls, list) else urls
 
-            if not self.monitor.get_network_metered():
-                threading.Thread(
-                    daemon=True,
-                    target=self._cache_bts_track,
-                    args=(track, stream_url)
-                ).start()
+            self._queue_cache(track)
 
             return stream_url
 
         raise AttributeError(f"Unhandled manifest mime type: {self.stream.manifest_mime_type}")
 
+    def _queue_cache(self, track) -> None:
+        """Queue a track for caching.
+
+        The download only starts while playback isn't using the network, so
+        it doesn't compete with the stream for bandwidth.
+        """
+        if not track or not getattr(utils, "MUSIC_DIR", None):
+            return
+        if self._cached_music_path(track):
+            return
+        if self.monitor.get_network_metered():
+            return
+        with self._cache_lock:
+            if track.id in self._cache_queued_ids:
+                return
+            self._cache_queued_ids.add(track.id)
+            self._cache_queue.append(track)
+        self._maybe_start_cache()
+
+    def _playback_uses_network(self) -> bool:
+        """Whether playback is streaming, i.e. using the network.
+
+        A stream is an http(s) url, or a local manifest whose segments are
+        remote. A plain file url is the music cache.
+        """
+        if not self.playing:
+            return False
+        uri = self.playbin.get_property("current-uri") or ""
+        return not uri.startswith("file://") or uri.endswith(".mpd")
+
+    def _maybe_start_cache(self) -> None:
+        """Start caching the next queued track, if it's safe to do so."""
+        with self._cache_lock:
+            if self._cache_thread and self._cache_thread.is_alive():
+                return
+            if self._playback_uses_network():
+                return
+            if not self._cache_queue:
+                return
+            track = self._cache_queue.pop(0)
+            self._cache_queued_ids.discard(track.id)
+            self._cache_thread = threading.Thread(
+                daemon=True, target=self._cache_worker, args=(track,)
+            )
+            self._cache_thread.start()
+
+    def _cache_worker(self, track) -> None:
+        """Download a queued track into the music cache."""
+        try:
+            if self._cached_music_path(track):
+                return
+            # Fetch a fresh stream for caching, independent of the one that's
+            # playing
+            stream = track.get_stream()
+            manifest = stream.get_stream_manifest()
+            if stream.manifest_mime_type == ManifestMimeType.MPD:
+                data = stream.get_manifest_data()
+                if not data:
+                    return
+                mpd_path = Path(utils.CACHE_DIR, f"manifest_cache_{track.id}.mpd")
+                with open(mpd_path, "w") as f:
+                    f.write(data)
+                try:
+                    self._cache_mpd_track(track, mpd_path)
+                finally:
+                    mpd_path.unlink(missing_ok=True)
+            elif stream.manifest_mime_type == ManifestMimeType.BTS:
+                urls = manifest.get_urls()
+                stream_url = urls[0] if isinstance(urls, list) else urls
+                self._cache_bts_track(track, stream_url)
+        except Exception:
+            logger.exception(f"Error caching track {track.id}")
+        finally:
+            with self._cache_lock:
+                self._cache_thread = None
+            # Continue with the next queued track, if it's safe to do so
+            GLib.idle_add(self._maybe_start_cache)
+
     def _cache_mpd_track(self, track, mpd_path):
-        """Download and cache MPD track via ffmpeg in background."""
+        """Download and cache MPD track via ffmpeg in background.
+
+        The download is paused while playback is streaming, so it doesn't
+        compete with it for bandwidth.
+        """
         cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
         tmp = cached_music.with_suffix(".tmp")
 
         try:
-            import subprocess
             logger.info(f"Caching MPD track: {track.id}")
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "ffmpeg",
                     # Leave the terminal alone when started from one: reading it from
@@ -687,18 +797,49 @@ class PlayerObject(GObject.GObject):
                     "-y", str(tmp)
                 ],
                 stdin=subprocess.DEVNULL,
-                capture_output=True
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
+            self._cache_process = proc
+            try:
+                self._pause_cache_while_streaming(proc)
+            finally:
+                self._cache_process = None
 
-            if result.returncode == 0:
+            stderr = proc.stderr.read()
+            proc.stderr.close()
+
+            if proc.returncode == 0:
                 tmp.rename(cached_music)
                 logger.info(f"Cached MPD track: {track.id}")
             else:
-                logger.warning(f"ffmpeg failed for {track.id}: {result.stderr.decode()}")
+                logger.warning(
+                    f"ffmpeg failed for {track.id}: {stderr.decode(errors='replace')}"
+                )
                 tmp.unlink(missing_ok=True)
         except Exception as e:
             logger.warning(f"Failed to cache MPD track {track.id}: {e}")
             tmp.unlink(missing_ok=True)
+
+    def _pause_cache_while_streaming(self, proc) -> None:
+        """Pause the cache download while playback is streaming.
+
+        TIDAL throttles per connection, so a cache download running in
+        parallel with a stream can starve it. ffmpeg is stopped and resumed
+        at the OS level, so the progress is kept.
+        """
+        paused = False
+        while proc.poll() is None:
+            streaming = self._playback_uses_network()
+            if streaming and not paused:
+                os.kill(proc.pid, signal.SIGSTOP)
+                paused = True
+                logger.info("Pausing track caching while streaming")
+            elif not streaming and paused:
+                os.kill(proc.pid, signal.SIGCONT)
+                paused = False
+                logger.info("Resuming track caching")
+            time.sleep(0.5)
 
     def _cache_bts_track(self, track, stream_url):
         """Download and cache BTS track in background."""
@@ -712,6 +853,10 @@ class PlayerObject(GObject.GObject):
             if response.status_code == 200:
                 with open(tmp, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
+                        # Pause the download while playback is streaming, so it
+                        # doesn't compete with it for bandwidth
+                        while self._playback_uses_network():
+                            time.sleep(1)
                         f.write(chunk)
                 tmp.rename(cached_music)
                 logger.info(f"Cached BTS track: {track.id}")
@@ -720,6 +865,38 @@ class PlayerObject(GObject.GObject):
         except Exception as e:
             logger.warning(f"Failed to cache BTS track {track.id}: {e}")
             tmp.unlink(missing_ok=True)
+
+    def _clean_stale_manifests(self) -> None:
+        """Remove manifest files from previous sessions.
+
+        They're only needed while their track is playing or being cached.
+        """
+        try:
+            for manifest in Path(utils.CACHE_DIR).glob("manifest_*.mpd"):
+                if time.time() - manifest.stat().st_mtime > 24 * 3600:
+                    manifest.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Error cleaning stale manifests")
+
+    def shutdown(self) -> None:
+        """Stop the background cache download, if one is running.
+
+        The cache threads are daemon, so quitting the app would otherwise
+        leave ffmpeg running as an orphan.
+        """
+        proc = self._cache_process
+        if proc and proc.poll() is None:
+            # If it was stopped while streaming, wake it so the terminate
+            # below isn't deferred until the process would resume on its own
+            try:
+                os.kill(proc.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def apply_replaygain_tags(self):
         """Apply ReplayGain normalization tags to the current track if enabled."""

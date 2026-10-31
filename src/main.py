@@ -85,6 +85,13 @@ class HighTideApplication(Adw.Application):
 
         self.win.present()
 
+    def do_shutdown(self) -> None:
+        """Shut down the application, e.g. when the last window is closed."""
+        # Stop any background cache download, so ffmpeg isn't orphaned
+        player = getattr(utils, "player_object", None)
+        if player:
+            player.shutdown()
+
     def on_about_action(self, widget: Any, *args) -> None:
         """Display the about dialog with application information"""
         about = Adw.AboutDialog(
