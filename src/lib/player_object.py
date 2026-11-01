@@ -627,6 +627,14 @@ class PlayerObject(GObject.GObject):
         self.last_buffer_per = -1
         self.buffer_grew_since = now
         self.stream_load_started = now
+        # The armed track is playing now: take it out of the playlist. The
+        # advance doesn't go through play_next(), so without this it stays at
+        # the head of the list and plays again at its end
+        if self.next_track is not None:
+            self._consume_started_track(self.next_track)
+            self.can_go_next = len(self._tracks_to_play) > 0
+            self.notify("can-go-next")
+            self.emit("song-added-to-queue")
 
         def detach_old():
             self._detach_branch(*old)
@@ -1392,6 +1400,26 @@ class PlayerObject(GObject.GObject):
         if self.playing:
             self.play()
 
+    def _consume_started_track(self, track: Track) -> None:
+        """Take a track out of what play_next() would play, now that it plays.
+
+        play_next() removes the track it plays from the queue or the playlist;
+        a gapless advance promotes an armed track without going through it, so
+        the same has to happen here — otherwise the track stays at the head of
+        the list and plays again at its end.
+        """
+        if self.queue and self.queue[0] is track:
+            self.queue.pop(0)
+            return
+        track_list = (
+            self._shuffled_tracks_to_play if self.shuffle else self._tracks_to_play
+        )
+        for index, candidate in enumerate(track_list):
+            if candidate is track:
+                # In place: tracks_to_play aliases whichever list this is
+                del track_list[index]
+                return
+
     def _peek_next_track(self) -> Track | None:
         """Get the track play_next(gapless=True) would play, without removing it"""
         if self._repeat_type == RepeatType.SONG:
@@ -1432,14 +1460,6 @@ class PlayerObject(GObject.GObject):
         except Exception:
             logger.exception("Error prefetching track stream")
 
-    def _has_next_track(self) -> bool:
-        """Whether play_next will play a track after the current one"""
-        return bool(
-            self.tracks_to_play
-            or self.queue
-            or (self.playing_track and self._repeat_type != RepeatType.NONE)
-        )
-
     def play_next(self, gapless=False):
         """Play the next track in the queue or playlist.
 
@@ -1447,11 +1467,13 @@ class PlayerObject(GObject.GObject):
             gapless: Whether to enqueue the track in gapless mode
         """
 
-        # A track is already enqueued from an about-to-finish
+        # A track is already armed for gapless playback
         if self.next_track:
-            logger.info("Using already enqueued track from gapless")
+            logger.info("Using already armed track from gapless")
             track = self.next_track
             self.next_track = None
+            # It plays now, so consume it like the branches below do
+            self._consume_started_track(track)
             self.play_track(track, gapless=gapless)
             return
 
