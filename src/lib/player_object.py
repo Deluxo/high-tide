@@ -251,7 +251,12 @@ class PlayerObject(GObject.GObject):
         # removed from the pipeline along with everything else
         self._detach_armed_next()
 
-        for child in self.pipeline.get_children():
+        # Snapshot the children: removing while indexing shifts the indices
+        children = [
+            self.pipeline.get_child_by_index(i)
+            for i in range(self.pipeline.get_children_count())
+        ]
+        for child in children:
             self.pipeline.remove(child)
 
         sink_name = {
