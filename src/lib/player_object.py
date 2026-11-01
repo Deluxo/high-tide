@@ -115,8 +115,17 @@ class PlayerObject(GObject.GObject):
         self.next_manifest: Any | None = None
         # a next branch is being attached and prerolled on a worker thread
         self._arming_next = False
+        # the branch's uridecodebin while it prerolls, for bus-message
+        # attribution before it is promoted to "armed"
+        self._arming_branch_element: Any | None = None
+        # bumped to invalidate an in-flight arm
+        self._arm_token = 0
         # fires of concat's notify::active-pad, to suppress the first one
         self._active_pad_fires = 0
+        # branches dropped on purpose, and until when their late bus messages
+        # are still attributed to them (a failing arm posts its errors just
+        # before it's detached)
+        self._dropped_branches: list[tuple[Any, float]] = []
 
         # Build the playback pipeline (see _build_pipeline)
         self._build_pipeline(preferred_sink)
@@ -397,6 +406,9 @@ class PlayerObject(GObject.GObject):
             if peer is not None:
                 queue_src.unlink(peer)
         self.concat.release_request_pad(concat_sink)
+        # Keep the branch's late bus messages (an error that failed the
+        # preroll is posted right before this) attributed to the branch
+        self._remember_dropped_branch(udb)
         # Drive both to NULL and block until the transitions complete:
         # removing an element still mid-transition disposes it in a non-NULL
         # state
@@ -421,7 +433,29 @@ class PlayerObject(GObject.GObject):
         self.next_uri = ""
         self.next_stream = None
         self.next_manifest = None
+        self._cancel_arm()
+
+    def _cancel_arm(self) -> None:
+        """Cancel an in-flight arm; its worker drops the branch it attached."""
+        self._arm_token += 1
         self._arming_next = False
+
+    def _repair_pipeline_state(self) -> None:
+        """Restore the pipeline after a branch failed its state change.
+
+        A child that fails an explicit state change leaves the parent's
+        state bookkeeping failed and PAUSED, and the pipeline then drops
+        the EOS that ends the current track. Asking for PLAYING again
+        rebuilds it. Runs on the main thread so it can't race play() or
+        pause().
+        """
+        GLib.idle_add(self._restore_pipeline_state)
+
+    def _restore_pipeline_state(self) -> None:
+        if not self.playing:
+            return
+        logger.info("Restoring the pipeline state after a failed next branch")
+        self.pipeline.set_state(Gst.State.PLAYING)
 
     def _arm_next_track(
         self, track: Track, stream: Any, manifest: Any, url: str
@@ -437,14 +471,15 @@ class PlayerObject(GObject.GObject):
             logger.info(f"Not arming {track.id}: it's not the next track anymore")
             return
         self._arming_next = True
+        self._arm_token += 1
         threading.Thread(
             daemon=True,
             target=self._arm_next_track_thread,
-            args=(track, stream, manifest, url),
+            args=(track, stream, manifest, url, self._arm_token),
         ).start()
 
     def _arm_next_track_thread(
-        self, track: Track, stream: Any, manifest: Any, url: str
+        self, track: Track, stream: Any, manifest: Any, url: str, token: int
     ) -> None:
         """Create and preroll the next branch (runs on a worker thread).
 
@@ -456,6 +491,8 @@ class PlayerObject(GObject.GObject):
         branch holds prerolled and switches in gap-free at the EOS.
         """
         udb = Gst.ElementFactory.make("uridecodebin", None)
+        # Attribute its bus messages to the branch before it is armed
+        self._arming_branch_element = udb
         udb.set_property("uri", url)
         # 15s of compressed buffer: the branch has the rest of the current
         # track as lead time to fill it
@@ -476,7 +513,10 @@ class PlayerObject(GObject.GObject):
             logger.error("Failed to request the concat's next sink pad")
             self.pipeline.remove(udb)
             self.pipeline.remove(branch_queue)
-            self._arming_next = False
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            if self._arm_token == token:
+                self._arming_next = False
             return
         queue_src.link(concat_sink)
 
@@ -492,14 +532,41 @@ class PlayerObject(GObject.GObject):
         # network source can't hang this thread)
         branch_queue.set_state(Gst.State.PAUSED)
         udb.set_state(Gst.State.PAUSED)
-        udb.get_state(15 * Gst.SECOND)
+        preroll_ret, _state, _pending = udb.get_state(15 * Gst.SECOND)
+        # The preroll must have completed, and a directly played track must
+        # not have superseded this arm (it drops the branch and re-uris the
+        # pipeline itself); otherwise drop the branch
+        superseded = token != self._arm_token
+        if superseded or preroll_ret != Gst.StateChangeReturn.SUCCESS:
+            if preroll_ret != Gst.StateChangeReturn.SUCCESS:
+                logger.warning(f"Next branch failed to preroll: {preroll_ret}")
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            self._detach_branch(udb, branch_queue, concat_sink)
+            if not superseded and preroll_ret != Gst.StateChangeReturn.SUCCESS:
+                # A failed child state change leaves the pipeline unable to
+                # report EOS, which would freeze the current track at its end
+                self._repair_pipeline_state()
+            if not superseded:
+                self._arming_next = False
+            return
         # Preroll done + pad linked: promote to PLAYING
-        branch_queue.sync_state_with_parent()
-        udb.sync_state_with_parent()
-
-        # A directly played track detaches the armed branch; if that happened
-        # while the arm was in progress, drop what we just attached
-        if not self._arming_next:
+        promoted = branch_queue.sync_state_with_parent()
+        promoted = udb.sync_state_with_parent() and promoted
+        if not promoted:
+            logger.warning("Next branch failed to start playing")
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            self._detach_branch(udb, branch_queue, concat_sink)
+            self._repair_pipeline_state()
+            if token == self._arm_token:
+                self._arming_next = False
+            return
+        if token != self._arm_token:
+            # A direct play superseded the arm while it was promoting; nobody
+            # else knows about this branch, so drop it here
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
             self._detach_branch(udb, branch_queue, concat_sink)
             return
         self.next_uridecodebin = udb
@@ -509,6 +576,8 @@ class PlayerObject(GObject.GObject):
         self.next_stream = stream
         self.next_manifest = manifest
         self.next_track = track
+        if self._arming_branch_element is udb:
+            self._arming_branch_element = None
         self._arming_next = False
         logger.info(f"Armed next track for gapless: {track.id}")
 
@@ -552,6 +621,12 @@ class PlayerObject(GObject.GObject):
         self.next_stream = None
         self.next_manifest = None
         self._arming_next = False
+        # The promoted track starts now: reset its buffer bookkeeping, as
+        # the direct-play path does
+        now = time.monotonic()
+        self.last_buffer_per = -1
+        self.buffer_grew_since = now
+        self.stream_load_started = now
 
         def detach_old():
             self._detach_branch(*old)
@@ -593,6 +668,21 @@ class PlayerObject(GObject.GObject):
     def _on_bus_error(self, bus: Any, message: Any) -> None:
         """Handle pipeline errors."""
         err, debug = message.parse_error()
+        # An error inside the armed next branch mustn't stop the current
+        # track: drop that branch and let the current track's EOS fall back
+        # to a normal play_next()
+        if self._message_from_armed_branch(message):
+            logger.warning(f"Next branch error: {err.message}")
+            # The "state change failed" follow-up comes from this same source
+            self._remember_dropped_element(message.src)
+            if self._arming_next:
+                # Still prerolling: the arm worker drops what it attached (and
+                # restores the pipeline state; don't invalidate the arm here,
+                # that would tell it the failure doesn't need repairing)
+                self._arming_next = False
+            else:
+                self._detach_armed_next()
+            return
         logger.error(f"Error: {err.message}")
         logger.error(f"Debug info: {debug}")
 
@@ -645,6 +735,11 @@ class PlayerObject(GObject.GObject):
         return age > 10 * 60 and age + remaining > 50 * 60
 
     def _on_buffering_message(self, bus: Any, message: Any) -> None:
+        # The armed next branch buffers in parallel; its messages mustn't
+        # drive the playing track's buffer state or spinner
+        if self._message_from_armed_branch(message):
+            self._remember_dropped_element(message.src)
+            return
         buffer_per: int = message.parse_buffering()
         mode, avg_in, avg_out, buff_left = message.parse_buffering_stats()
 
@@ -682,6 +777,65 @@ class PlayerObject(GObject.GObject):
         self.notify("can-go-next")
         self.emit("song-changed")
 
+    def _remember_dropped_element(self, element: Any) -> None:
+        """Remember a branch element whose late messages are still its own.
+
+        The elements inside a uridecodebin are unparented when it goes NULL,
+        so a late error's parent chain no longer leads to the branch; its
+        source element is remembered instead while messages are suppressed.
+        """
+        deadline = time.monotonic() + 5.0
+        for i, (known, _deadline) in enumerate(self._dropped_branches):
+            if known is element:
+                self._dropped_branches[i] = (element, deadline)
+                return
+        self._dropped_branches.append((element, deadline))
+
+    def _remember_dropped_branch(self, element: Any) -> None:
+        """Keep a dropped branch's late bus messages attributed to it."""
+        for child in self._branch_elements(element):
+            self._remember_dropped_element(child)
+
+    def _branch_elements(self, element: Any) -> list[Any]:
+        """All elements inside a branch element, for message attribution."""
+        elements = [element]
+        if isinstance(element, Gst.Bin):
+            for i in range(element.get_children_count()):
+                elements += self._branch_elements(element.get_child_by_index(i))
+        return elements
+
+    def _is_dropped_branch(self, element: Any) -> bool:
+        """Whether the element belongs to a branch that was just dropped."""
+        if not self._dropped_branches:
+            return False
+        now = time.monotonic()
+        self._dropped_branches = [
+            (e, deadline)
+            for (e, deadline) in self._dropped_branches
+            if deadline > now
+        ]
+        return any(e is element for (e, _deadline) in self._dropped_branches)
+
+    def _message_from_armed_branch(self, message: Any) -> bool:
+        """Whether a bus message came from a branch other than the playing one.
+
+        The armed branch — and a branch that was just dropped — shares the
+        pipeline's bus, so its stream-start, buffering and error messages
+        must not be mistaken for the playing track's.
+        """
+        obj = message.src
+        while obj is not None:
+            if obj is self.uridecodebin:
+                return False
+            if (
+                obj is self.next_uridecodebin
+                or obj is self._arming_branch_element
+                or self._is_dropped_branch(obj)
+            ):
+                return True
+            obj = obj.get_parent()
+        return False
+
     def _on_track_start(self, bus: Any, message: Any):
         """This Method is called when a new track starts playing
 
@@ -691,8 +845,11 @@ class PlayerObject(GObject.GObject):
         """
         # The armed next branch's source fires stream-start during its
         # preroll; that track becomes current on the gapless advance, which
-        # updates the UI then
-        if self._arming_next:
+        # updates the UI then. A message that arrives after the arm worker
+        # finished is still attributed to the branch by its parent chain.
+        if self._message_from_armed_branch(message):
+            # Its follow-up messages may arrive after the branch is dropped
+            self._remember_dropped_element(message.src)
             return
         self._track_started()
 
