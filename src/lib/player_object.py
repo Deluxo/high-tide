@@ -391,8 +391,11 @@ class PlayerObject(GObject.GObject):
         hang the NULL transition on a live network source.
         """
         queue_src = branch_queue.get_static_pad("src")
-        if queue_src is not None and queue_src.is_linked():
-            queue_src.unlink()
+        if queue_src is not None:
+            # gst_pad_unlink takes the peer pad as an argument
+            peer = queue_src.get_peer()
+            if peer is not None:
+                queue_src.unlink(peer)
         self.concat.release_request_pad(concat_sink)
         # Drive both to NULL and block until the transitions complete:
         # removing an element still mid-transition disposes it in a non-NULL
