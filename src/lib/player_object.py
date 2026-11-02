@@ -844,6 +844,21 @@ class PlayerObject(GObject.GObject):
             obj = obj.get_parent()
         return False
 
+    def _stream_start_from_armed_branch(self) -> bool:
+        """Whether a stream-start belongs to the armed branch, not the playing one.
+
+        stream-start messages reach the bus with the pipeline as their source
+        (GstBin forwards them), so message.src can't identify the branch. A
+        branch is armed, prerolling, or the concat has already switched to it
+        while the advance is still queued: in all those cases the playing
+        track has already started, so the message isn't a new track.
+        """
+        if self.next_uridecodebin is not None or self._arming_next:
+            return True
+        active_pad = self.concat.get_property("active-pad")
+        peer = active_pad.get_peer() if active_pad is not None else None
+        return peer is not None and peer.get_parent() is self.next_branch_queue
+
     def _on_track_start(self, bus: Any, message: Any):
         """This Method is called when a new track starts playing
 
@@ -853,11 +868,13 @@ class PlayerObject(GObject.GObject):
         """
         # The armed next branch's source fires stream-start during its
         # preroll; that track becomes current on the gapless advance, which
-        # updates the UI then. A message that arrives after the arm worker
-        # finished is still attributed to the branch by its parent chain.
+        # updates the UI then. The message comes from the pipeline, so the
+        # branch is identified by the pipeline state instead of message.src.
         if self._message_from_armed_branch(message):
             # Its follow-up messages may arrive after the branch is dropped
             self._remember_dropped_element(message.src)
+            return
+        if self._stream_start_from_armed_branch():
             return
         self._track_started()
 
