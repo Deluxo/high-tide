@@ -20,6 +20,7 @@
 import logging
 import random
 import threading
+import time
 import base64
 from enum import IntEnum
 from gettext import gettext as _
@@ -142,6 +143,40 @@ class PlayerObject(GObject.GObject):
         self.update_timer: Any | None = None
         self.seek_after_sink_reload: int | None = None
         self.seeked_to_end = False
+
+        # stream stall detection and auto-recovery: pause when the buffer
+        # runs dry and no data comes from the server, then reconnect with
+        # fresh stream urls at the position where it stalled
+        self._current_uri: str = ""
+        # True when playing a fully cached local file (no network stream to
+        # refresh); an MPD manifest is a local file but its segments are not
+        self._current_uri_is_local: bool = False
+        self._last_position: int = 0
+        self._progress_at: float = time.monotonic()
+        self._buffer_percent: int = -1
+        self._buffer_changed_at: float = time.monotonic()
+        self._stall_paused: bool = False
+        self._stall_position: int = 0
+        self._stall_track_id: int | None = None
+        self._retry_attempts: int = 0
+        self._retry_timer: Any | None = None
+        self._resume_at: float = 0.0
+        self._retrying: bool = False
+        # counts track load requests so a stale url fetch (superseded by a
+        # user action during a stall retry) is dropped before it hits playbin
+        self._load_seq: int = 0
+
+        # how long without position progress counts as a stall, and how
+        # long the buffer may stop growing before it is considered dead
+        self.STALL_AFTER: float = 3.0
+        # a track that never started playing gets a longer grace period,
+        # so a slow initial buffer is not mistaken for a dead stream
+        self.START_STALL_AFTER: float = 10.0
+        self.BUFFER_DEAD_FOR: float = 3.0
+        self.RETRY_DELAYS: tuple[int, ...] = (3, 6, 12)
+        self.MAX_STALL_RETRIES: int = 3
+        # a retry that stays healthy for this long clears the retry budget
+        self.HEALTHY_AFTER: float = 30.0
 
         # next track variables for gapless
         self.next_track: Any | None = None
@@ -273,10 +308,18 @@ class PlayerObject(GObject.GObject):
             utils.send_toast(_("ALSA Audio Device is not available"), 5)
             self.pause()
             self.pipeline.set_state(Gst.State.NULL)
+        elif self.playing:
+            # A dead connection or failed DASH segment leaves the pipeline
+            # unusable; pause and reconnect with fresh stream urls.
+            self._begin_stall()
 
     def _on_buffering_message(self, bus: Any, message: Any) -> None:
         buffer_per: int = message.parse_buffering()
         mode, avg_in, avg_out, buff_left = message.parse_buffering_stats()
+
+        if buffer_per > self._buffer_percent:
+            self._buffer_changed_at = time.monotonic()
+        self._buffer_percent = buffer_per
 
         self.emit("buffering", buffer_per)
 
@@ -326,6 +369,12 @@ class PlayerObject(GObject.GObject):
         if self.update_timer:
             GLib.source_remove(self.update_timer)
         self.update_timer = GLib.timeout_add(1000, self._update_slider_callback)
+
+        # Fresh stream starts from a clean slate for the stall watchdog
+        self._last_position = 0
+        self._progress_at = time.monotonic()
+        self._buffer_changed_at = time.monotonic()
+        self._stall_paused = False
 
         self.seeked_to_end = False
         if self.seek_after_sink_reload:
@@ -417,6 +466,22 @@ class PlayerObject(GObject.GObject):
 
     def play(self) -> None:
         """Start playback of the current track."""
+        if self._stall_paused and not self._retrying and self.playing_track:
+            # The stream was dead when we paused; the old connection is
+            # likely still dead, so re-fetch urls and resume where it stalled.
+            # _stall_paused stays set until the fetch succeeds, so a failed
+            # fetch re-arms the retry from _play_track_thread
+            if self._retry_timer is not None:
+                GLib.source_remove(self._retry_timer)
+                self._retry_timer = None
+            self._retry_attempts = 0
+            duration = self.query_duration()
+            if duration > 0:
+                self.seek_after_sink_reload = self._stall_position / duration
+            self._retrying = True
+            self.play_track(self.playing_track)
+            return
+
         self.playing = True
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -443,6 +508,54 @@ class PlayerObject(GObject.GObject):
         else:
             self.play()
 
+    def _reset_stall(self) -> None:
+        """Clear all stall bookkeeping (user seeked or a new track is played)."""
+        if self._retry_timer is not None:
+            GLib.source_remove(self._retry_timer)
+            self._retry_timer = None
+        self._stall_paused = False
+        self._retrying = False
+        self._retry_attempts = 0
+        self.seek_after_sink_reload = None
+        self._last_position = 0
+        self._progress_at = time.monotonic()
+        self._buffer_changed_at = time.monotonic()
+
+    def _begin_stall(self) -> None:
+        """Pause playback because the stream of the playing track stalled."""
+        if self._stall_paused:
+            return
+        self._stall_position = max(0, self.query_position(default=0))
+        self._stall_track_id = self.playing_track.id if self.playing_track else None
+        self._stall_paused = True
+        self.pause()
+        utils.send_toast(_("Stream stalled, retrying…"), 3)
+        self._schedule_retry()
+
+    def _schedule_retry(self) -> None:
+        delay = self.RETRY_DELAYS[
+            min(self._retry_attempts, len(self.RETRY_DELAYS) - 1)
+        ]
+        self._retry_timer = GLib.timeout_add(int(delay * 1000), self._retry)
+
+    def _retry(self) -> bool:
+        """Reconnect with fresh stream urls and resume at the stall position."""
+        self._retry_timer = None
+        if not self._stall_paused or not self.playing_track:
+            return False
+        if self._retry_attempts >= self.MAX_STALL_RETRIES:
+            utils.send_toast(_("Playback paused: no data from TIDAL"), 5)
+            return False
+
+        self._retry_attempts += 1
+        self._resume_at = time.monotonic()
+        duration = self.query_duration()
+        if duration > 0:
+            self.seek_after_sink_reload = self._stall_position / duration
+        self._retrying = True
+        self.play_track(self.playing_track)
+        return False
+
     def play_track(self, track: Track, gapless=False) -> None:
         """Play a specific track immediately or enqueue it for gapless playback
 
@@ -450,9 +563,17 @@ class PlayerObject(GObject.GObject):
             track: The Track object to play
             gapless: Whether to enqueue the track for gapless playback
         """
-        threading.Thread(target=self._play_track_thread, args=(track, gapless)).start()
+        playing_id = self.playing_track.id if self.playing_track else None
+        if gapless or track.id != playing_id:
+            # A user-requested track (not our own retry) supersedes a stalled
+            # stream and its pending retry
+            self._reset_stall()
+        self._load_seq += 1
+        threading.Thread(
+            target=self._play_track_thread, args=(track, gapless, self._load_seq)
+        ).start()
 
-    def _play_track_thread(self, track: Track, gapless=False) -> None:
+    def _play_track_thread(self, track: Track, gapless=False, seq: int = 0) -> None:
         self.stream = None
         self.manifest = None
 
@@ -461,24 +582,34 @@ class PlayerObject(GObject.GObject):
             self.manifest = self.stream.get_stream_manifest()
             urls = self.manifest.get_urls()
 
-            music_url = self._get_cached_or_stream_url(track, gapless)
+            music_url, is_local = self._get_cached_or_stream_url(track, gapless)
 
-            GLib.idle_add(self._play_track_url, track, music_url, gapless)
+            GLib.idle_add(self._play_track_url, track, music_url, gapless, seq, is_local)
         except Exception:
             logger.exception("Error getting track URL")
+            if self._retrying and seq == self._load_seq:
+                # The TIDAL API is unreachable; the stream we were retrying
+                # for can't be fetched, so try again after a cooldown
+                self._retrying = False
+                self._schedule_retry()
 
     def _get_cached_or_stream_url(self, track, gapless=False):
-        """Get URL from cache or stream, caching if not cached."""
+        """Get URL from cache or stream, caching if not cached.
+
+        Returns:
+            tuple: (url, is_local), where is_local means the whole file is
+            on disk and there is no network stream behind it
+        """
         if not hasattr(utils, 'MUSIC_DIR') or not utils.MUSIC_DIR:
-            return self._get_stream_url(track, gapless)
+            return self._get_stream_url(track, gapless), False
 
         cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
 
         if cached_music.exists():
             logger.info(f"Playing from music cache: {track.id}")
-            return f"file://{cached_music}"
+            return f"file://{cached_music}", True
 
-        return self._get_stream_url(track, gapless)
+        return self._get_stream_url(track, gapless), False
 
     def _get_stream_url(self, track, gapless=False):
         """Get stream URL and start background caching."""
@@ -607,13 +738,21 @@ class PlayerObject(GObject.GObject):
         # toggling the option
         self.most_recent_rg_tags = f"tags={tags}"
 
-    def _play_track_url(self, track, music_url, gapless=False):
+    def _play_track_url(self, track, music_url, gapless=False, seq: int = 0,
+                        is_local: bool = False):
         """Set up and play track from URL."""
+        # The user started a different track (or seeked) while this url was
+        # being fetched; drop it so it can't race the newer request
+        if not gapless and seq != self._load_seq:
+            return
+
         if not gapless:
             self.use_about_to_finish = False
             self.pipeline.set_state(Gst.State.NULL)
             self.playbin.set_property("volume", self.playbin.get_property("volume"))
         self.playbin.set_property("uri", music_url)
+        self._current_uri = music_url
+        self._current_uri_is_local = is_local
 
         logger.info(music_url)
 
@@ -622,7 +761,11 @@ class PlayerObject(GObject.GObject):
         else:
             self.set_track(track)
 
-        if not gapless and self.playing:
+        if not gapless and (self.playing or self._retrying):
+            # Stay paused until the urls were fetched, then start; the seek
+            # to the stall position is applied in _on_track_start
+            self._retrying = False
+            self._stall_paused = False
             self.play()
 
         if not gapless:
@@ -773,8 +916,52 @@ class PlayerObject(GObject.GObject):
         if not self.duration:
             logger.warning("Duration missing, trying again")
             self.duration = self.query_duration()
+        self._check_stall()
         self.emit("update-slider")
         return self.playing
+
+    def _check_stall(self) -> None:
+        """Pause playback when the stream stalls and no data arrives.
+
+        A frozen position plus a dead buffer (the buffering percentage not
+        growing) means the server stopped sending, not that the download is
+        just slow; pause and let the retry logic reconnect.
+        """
+        if not self.playing or self._stall_paused:
+            return
+        # The gapless handoff briefly freezes the position on purpose
+        if self.next_track:
+            return
+        # A cached local file has no network stream to refresh
+        if not self._current_uri or self._current_uri_is_local:
+            return
+
+        position = self.query_position(default=0)
+        now = time.monotonic()
+        if position != self._last_position:
+            self._last_position = position
+            self._progress_at = now
+            # A retry that stays healthy clears its budget
+            if (
+                self._retry_attempts
+                and now - self._resume_at >= self.HEALTHY_AFTER
+            ):
+                self._retry_attempts = 0
+            return
+
+        stalled_for = now - self._progress_at
+        threshold = self.START_STALL_AFTER if position <= 0 else self.STALL_AFTER
+        if stalled_for < threshold:
+            return
+        # A buffer that is still growing means the download is slow, not dead
+        if now - self._buffer_changed_at < self.BUFFER_DEAD_FOR:
+            return
+
+        logger.warning(
+            f"Stream stalled for {stalled_for:.0f}s at "
+            f"{position / Gst.SECOND:.1f}s, pausing and retrying"
+        )
+        self._begin_stall()
 
     def query_duration(self):
         """Get the duration of the current track.
@@ -803,6 +990,12 @@ class PlayerObject(GObject.GObject):
         Args:
             seek_fraction (float): Position as a fraction of total duration (0.0 to 1.0)
         """
+
+        # A user seek means we're no longer stalled (or on its way to it);
+        # drop any track url that was fetched for a stall retry so it can't
+        # restart playback from 0 after this seek
+        self._reset_stall()
+        self._load_seq += 1
 
         # If a seek close to the end is performed then skip
         # Avoids UI desync and stuck tracks

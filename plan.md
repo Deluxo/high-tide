@@ -50,7 +50,7 @@ Design decisions (confirmed with the user):
 
 ## Steps
 
-- [ ] 1. Add stall bookkeeping fields + constants to `PlayerObject.__init__`:
+- [x] 1. Add stall bookkeeping fields + constants to `PlayerObject.__init__`:
       `_current_uri`, `_last_position`, `_progress_at`, `_buffer_percent`,
       `_buffer_changed_at`, `_stall_paused`, `_stall_position`,
       `_stall_track_id`, `_retry_attempts`, `_retry_timer`, `_resume_at`,
@@ -59,13 +59,13 @@ Design decisions (confirmed with the user):
       `BUFFER_DEAD_FOR = 3.0`, `RETRY_DELAYS = (3, 6, 12)`,
       `MAX_STALL_RETRIES = 3`, `HEALTHY_AFTER = 30.0` (seconds; use
       `time.monotonic()`).
-- [ ] 2. Track the URI actually handed to playbin in `_play_track_url`
+- [x] 2. Track the URI actually handed to playbin in `_play_track_url`
       (`self._current_uri = music_url`). Used to distinguish a network stream
       from a `file://` music-cache file.
-- [ ] 3. Extend `_on_buffering_message`: on a percentage increase set
+- [x] 3. Extend `_on_buffering_message`: on a percentage increase set
       `_buffer_changed_at = time.monotonic()`; always store
       `_buffer_percent`; keep emitting `"buffering"`.
-- [ ] 4. Implement `_check_stall()` and call it from
+- [x] 4. Implement `_check_stall()` and call it from
       `_update_slider_callback` while `self.playing`:
       - `position = query_position(default=-1)`.
       - If the position changed: `_progress_at = now`; if a retry has been
@@ -77,12 +77,12 @@ Design decisions (confirmed with the user):
         `START_STALL_AFTER`, with the same buffer-growth rule.
       - Skip altogether for `file://` URIs (cache file: pause only, no retry;
         simpler: no detection at all for local files).
-- [ ] 5. Implement `_begin_stall()`:
+- [x] 5. Implement `_begin_stall()`:
       remember the position (fall back to the last seek target if the query
       returns 0), remember `_stall_track_id`, set `_stall_paused = True`,
       call `pause()`, toast once (`_("Stream stalled, retrying…")`), and
       arm the retry timer.
-- [ ] 6. Implement retry scheduling/execution:
+- [x] 6. Implement retry scheduling/execution:
       - `_schedule_retry()` uses `RETRY_DELAYS[min(_retry_attempts, len-1)]`
         via a one-shot `GLib.timeout_add`; store the source id in
         `_retry_timer`.
@@ -95,28 +95,28 @@ Design decisions (confirmed with the user):
         `seek_after_sink_reload = _stall_position / duration` (only when
         `duration > 0`), and call `play_track(self.playing_track)` to fetch
         fresh URLs.
-- [ ] 7. Resume through the fetch: in `_play_track_url`, when `_retrying` is
+- [x] 7. Resume through the fetch: in `_play_track_url`, when `_retrying` is
       set, start playback even though `playing` is still False (we stayed
       paused during the fetch), clear `_retrying`. `_on_track_start` already
       applies `seek_after_sink_reload`, which resumes at the stall position.
       In `_play_track_thread`'s `except` branch, if `_retrying` was set,
       schedule the next retry instead of dying silently (covers
       `track.get_stream()` failing because the TIDAL API is unreachable).
-- [ ] 8. Manual play: in `play()`, if `_stall_paused`, cancel the retry timer,
+- [x] 8. Manual play: in `play()`, if `_stall_paused`, cancel the retry timer,
       reset `_retry_attempts`, clear `_stall_paused`, and go through the same
       re-fetch + seek path instead of `set_state(PLAYING)`. Keep this
       non-recursive (the flag is cleared before `play_track` runs).
-- [ ] 9. Handle bus errors: keep the two existing special cases, then route
+- [x] 9. Handle bus errors: keep the two existing special cases, then route
       any other pipeline error to `_begin_stall()` when `self.playing`.
       Pipeline errors leave GStreamer in an unusable state, so the retry must
       do a full URI re-fetch (which the path above already does).
-- [ ] 10. Reset the stall state on real user actions: clear the timer, flags
+- [x] 10. Reset the stall state on real user actions: clear the timer, flags
       and `seek_after_sink_reload` when a different track is requested
       (`play_track` with a track whose id differs from `_stall_track_id`), on
       `seek()`, on end-of-queue `pause()`, and do not run detection while a
       gapless next track is armed (`next_track` set) so the handoff window is
       not mistaken for a stall.
-- [ ] 11. UI (`src/window.py`): hide `buffer_spinner` when playback becomes
+- [x] 11. UI (`src/window.py`): hide `buffer_spinner` when playback becomes
       paused (extend `update_controls`, which already listens to
       `notify::playing`), so a paused-for-stall player does not spin forever.
 
@@ -136,7 +136,7 @@ Design decisions (confirmed with the user):
       seek is applied to the wrong track, and the new action plays normally.
 - [ ] Playback from the local music cache (`file://`) never triggers a
       network retry.
-- [ ] `python3 -m compileall src` passes; `ruff check --select E9,F` reports
+- [x] `python3 -m compileall src` passes; `ruff check --select E9,F` reports
       no new findings on the changed files (the two remaining warnings, an
       unused `urls` and an unused `tidalapi` import, exist identically on
       unmodified master).

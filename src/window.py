@@ -489,6 +489,9 @@ class HighTideWindow(Adw.ApplicationWindow):
             self.play_button.set_icon_name("media-playback-pause-symbolic")
         else:
             self.play_button.set_icon_name("media-playback-start-symbolic")
+            # A paused player isn't buffering (e.g. paused after a stalled
+            # stream), so don't keep the spinner spinning
+            self.buffer_spinner.set_visible(False)
 
     def update_repeat_button(self, player, repeat_type):
         """Update the repeat button icon based on current repeat mode"""
