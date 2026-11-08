@@ -186,6 +186,26 @@ class PlayerObject(GObject.GObject):
         # where the last seek went, as the position can't be queried until it's done
         self.last_seek_position: int | None = None
 
+        # stall recovery: once the immediate reconnects are spent, playback
+        # is paused (so the UI and MPRIS say so) and retried with fresh
+        # stream urls on a delay; if those are spent too, it stays paused
+        self._stall_paused: bool = False
+        # where to resume from after a stall reconnect
+        self._stall_position: int = 0
+        # a stall retry (or the user's play after one) is loading fresh urls
+        self._stall_resuming: bool = False
+        # when the in-flight resume started, to judge it against its preroll
+        self._resume_started: float = 0.0
+        # automatic retries attempted since the last successful resume
+        self._retry_attempts: int = 0
+        # the GLib timer for the next automatic retry, if any
+        self._retry_timer: Any | None = None
+        # the delays between automatic stall retries
+        self.RETRY_DELAYS: tuple[int, ...] = (3, 6, 12)
+        self.MAX_STALL_RETRIES: int = 3
+        # how long a resume may take to preroll before it's judged a failure
+        self.STALL_RESUME_SETTLE: float = 20.0
+
         # next track variables for gapless
         self.next_track: Any | None = None
         # id of the track whose stream is being prefetched, to avoid
@@ -668,6 +688,10 @@ class PlayerObject(GObject.GObject):
         if was_playing and duration != 0:
             self.pipeline.set_state(Gst.State.PLAYING)
             self.seek_after_sink_reload = position / duration
+        elif self._stall_paused and duration != 0:
+            # A sink change during stall recovery reloads from the start; keep
+            # the resume position for when the recovery plays on
+            self.seek_after_sink_reload = position / duration
 
     def _on_bus_eos(self, *args) -> None:
         """Handle end of stream: play the next track (or stop at the end)."""
@@ -721,6 +745,12 @@ class PlayerObject(GObject.GObject):
                 "Stream error: Couldn't download fragments. Reloading track..."
             )
             self._reload_track()
+        elif self._stall_paused and self._stall_resuming:
+            # An unhandled error while a stall retry's fresh urls load: this
+            # attempt didn't take, the next one is due on its own timer
+            self._stall_resuming = False
+            self._resume_started = 0.0
+            self._schedule_retry()
 
     def _reload_track(self) -> None:
         """Load the playing track again and continue from the same position"""
@@ -904,6 +934,17 @@ class PlayerObject(GObject.GObject):
             self.seek(self.seek_after_sink_reload, accurate=True)
             self.seek_after_sink_reload = None
 
+        if self._stall_resuming:
+            # A stall retry's fresh stream prerolled (with a full buffer
+            # ahead): resume from the position seeked above and clear the
+            # recovery state
+            self._stall_resuming = False
+            self._resume_started = 0.0
+            self._stall_paused = False
+            self._retry_attempts = 0
+            self.stream_reconnects = 0
+            self.play()
+
         self.can_go_prev = len(self.played_songs) > 0
         # Only notify to deactivate
         if not self.can_go_prev:
@@ -994,6 +1035,22 @@ class PlayerObject(GObject.GObject):
 
     def play(self) -> None:
         """Start playback of the current track."""
+        if self._stall_paused and self.playing_track:
+            # The stream was dead when it paused, so the old connection is
+            # likely still dead: re-fetch the urls and resume where it
+            # stalled. _stall_paused stays set until the fresh stream takes
+            # over, so a failed fetch keeps the recovery armed
+            if self._retry_timer is not None:
+                GLib.source_remove(self._retry_timer)
+                self._retry_timer = None
+            self._retry_attempts = 0
+            duration = self.query_duration()
+            if duration > 0:
+                self.seek_after_sink_reload = self._stall_position / duration
+            self._stall_resuming = True
+            self._resume_started = time.monotonic()
+            self.play_track(self.playing_track)
+            return
         self.playing = True
         if self._stream_expires_soon():
             # Resuming after a long pause: get new stream urls (or play the track from
@@ -1036,6 +1093,10 @@ class PlayerObject(GObject.GObject):
             track: The Track object to play
             gapless: Whether to enqueue the track for gapless playback
         """
+        # A different track replaces the playing one: abandon any stall
+        # recovery for the old one
+        if self._stall_paused and track is not self.playing_track:
+            self._reset_stall()
         if gapless:
             self.gapless_request = track
             self.loading_gapless = True
@@ -1652,11 +1713,11 @@ class PlayerObject(GObject.GObject):
                 self._prefetch_next_track()
         self._check_stream_stuck()
         self.emit("update-slider")
-        if not self.playing:
+        if not self.playing and not self._stall_paused:
             # Returning False removes the timer. While it keeps running, keep its id
             # so the next play() or track start replaces it instead of adding another
             self.update_timer = None
-        return self.playing
+        return self.playing or self._stall_paused
 
     def _check_stream_stuck(self) -> None:
         """Recover when the stream of the playing track is stuck.
@@ -1666,6 +1727,10 @@ class PlayerObject(GObject.GObject):
         not a slow download), reconnect: re-fetch the stream for a fresh set of
         urls and a fresh connection to the CDN, which may land on a faster edge.
         """
+        if self._stall_paused:
+            # Playback is paused for stall recovery; judge the in-flight resume
+            self._check_stall_resume()
+            return
         position = self.query_position(-1)
         now = time.monotonic()
         if not self.playing or position != self.last_position:
@@ -1710,8 +1775,9 @@ class PlayerObject(GObject.GObject):
         if not buffer_dead and not load_too_long:
             return
         if self.stream_reconnects >= self.MAX_STREAM_RECONNECTS:
-            # Gave up; don't retry on every timer tick
-            self.position_stuck_since = now
+            # The immediate reloads kept hitting the same dead edge; pause and
+            # retry on a delay, which also tells the user something is wrong
+            self._begin_stall()
             return
         self.stream_reconnects += 1
         self.position_stuck_since = now
@@ -1720,6 +1786,77 @@ class PlayerObject(GObject.GObject):
             f"({self.stream_reconnects}/{self.MAX_STREAM_RECONNECTS})"
         )
         self._reload_track()
+
+    def _begin_stall(self) -> None:
+        """The playing track's stream is dead: pause and retry on a delay.
+
+        Pausing (instead of silently buffering forever) makes the UI and
+        MPRIS reflect that nothing is playing, and gives the retries room to
+        work instead of racing the reconnects for the same dead edge.
+        """
+        if self._stall_paused:
+            return
+        self._stall_position = max(0, self.query_position(default=0))
+        self._stall_paused = True
+        # The watchdog stays quiet while paused; _check_stall_resume takes over
+        self.position_stuck_since = time.monotonic()
+        utils.send_toast(_("Stream stalled, retrying…"), 3)
+        self.pause()
+        self._schedule_retry()
+
+    def _reset_stall(self) -> None:
+        """Abandon stall recovery (the user seeked or a new track is playing)."""
+        if self._retry_timer is not None:
+            GLib.source_remove(self._retry_timer)
+            self._retry_timer = None
+        self._stall_paused = False
+        self._stall_resuming = False
+        self._resume_started = 0.0
+        self._retry_attempts = 0
+
+    def _schedule_retry(self) -> None:
+        """Arm the next automatic stall retry, if none is armed yet."""
+        if self._retry_timer is not None:
+            return
+        delay = self.RETRY_DELAYS[
+            min(self._retry_attempts, len(self.RETRY_DELAYS) - 1)
+        ]
+        self._retry_timer = GLib.timeout_add(int(delay * 1000), self._stall_retry)
+
+    def _stall_retry(self) -> bool:
+        """Reconnect with fresh stream urls at the stall position."""
+        self._retry_timer = None
+        if not self._stall_paused or not self.playing_track:
+            return False
+        if self._retry_attempts >= self.MAX_STALL_RETRIES:
+            # The retries are spent; stay paused and tell the user
+            utils.send_toast(_("Playback paused: no data from TIDAL"), 5)
+            return False
+        self._retry_attempts += 1
+        duration = self.query_duration()
+        if duration > 0:
+            self.seek_after_sink_reload = self._stall_position / duration
+        self._stall_resuming = True
+        self._resume_started = time.monotonic()
+        self.play_track(self.playing_track)
+        return False
+
+    def _check_stall_resume(self) -> None:
+        """Judge an in-flight stall resume, while playback is paused.
+
+        The resume's fresh stream takes over when it prerolls (its
+        stream-start then resumes playback from _track_started); if it
+        doesn't start within the settle time, the edge is dead again and the
+        next retry is due.
+        """
+        if not self._stall_resuming:
+            return
+        if time.monotonic() - self._resume_started < self.STALL_RESUME_SETTLE:
+            return
+        logger.warning("Stall resume didn't start, scheduling the next retry")
+        self._stall_resuming = False
+        self._resume_started = 0.0
+        self._schedule_retry()
 
     def query_duration(self):
         """Get the duration of the current track.
@@ -1751,6 +1888,10 @@ class PlayerObject(GObject.GObject):
                 keyframe, which can be seconds earlier in a stream
         """
 
+        # A user seek abandons the stall recovery and its retry budget; the
+        # resume's own seek (from _track_started) runs while resuming
+        if self._stall_paused and not self._stall_resuming:
+            self._reset_stall()
         # If a seek close to the end is performed then skip
         # Avoids UI desync and stuck tracks
         if not self.seeked_to_end and seek_fraction > 0.98:

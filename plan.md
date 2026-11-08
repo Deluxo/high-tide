@@ -168,12 +168,59 @@ two static checks above. A reproduction harness would need TIDAL credentials.
   "Playing" when the retry starts. This is deliberate: the UI should mirror
   the real state instead of claiming playback continues.
 
+## Phase 2: port to `fork/master` (the sone-style pipeline)
+
+The fork's player already has stuck-stream machinery (`_check_stream_stuck`:
+3 s frozen position, buffer-growth check, up to 5 immediate reconnects, music
+cache fallback), but it **silently gives up** after 5 reconnects and keeps
+claiming "playing". Phase 2 layers the pause + bounded-retry semantics on top:
+
+- Exhausted reconnects → `_begin_stall()`: pause (UI/MPRIS reflect it) +
+  toast, then bounded retries with fresh URLs at 3 s / 6 s / 12 s.
+- A retry "takes" when its fresh stream prerolls (stream-start, full buffer
+  ahead): `_track_started` resumes playback at the stall position. No start
+  within `STALL_RESUME_SETTLE` (20 s) or an unhandled bus error → next delay;
+  exhausted → stay paused with a "no data from TIDAL" toast.
+- Manual play while stall-paused re-fetches + seeks (never bare
+  `set_state(PLAYING)`); user seek abandons the recovery; a different track
+  replaces it.
+- The update timer stays alive while stall-paused so the tick can judge the
+  in-flight resume.
+
+Steps:
+
+- [x] 1. Merge `fork/master` into `master` with `-X theirs`; reset
+      `player_object.py` to the exact fork version inside the merge commit so
+      the feature sits on a clean base (the `window.py` spinner fix survives).
+- [x] 2. Implement the stall-recovery layer on the fork pipeline:
+      `_begin_stall`, `_reset_stall`, `_schedule_retry`, `_stall_retry`,
+      `_check_stall_resume`; wire into `__init__`, `play()`, `seek()`,
+      `play_track()`, `_on_bus_error`, `_track_started`,
+      `_update_slider_callback`, `_check_stream_stuck`, `change_audio_sink`.
+- [x] 3. `python3 -m compileall` + `ruff check` (no new findings vs fork).
+- [ ] 4. Commit, retag `v1.5.1`, push branch to `fork/master` + tag.
+
+Phase 2 decisions:
+
+- 2026-11-08: Keep the fork's immediate-reconnect loop and cache fallback
+  untouched; the pause + retry only takes over when those are exhausted
+  (user choice: "-X theirs, implement your fix on top").
+- 2026-11-08: A resume is judged by its preroll (stream-start), not by buffer
+  percentage: a fresh uridecodebin buffers 15 s of audio before prerolling, so
+  stream-start already implies a full buffer ahead.
+- 2026-11-08: The update timer (`_update_slider_callback`) keeps running while
+  stall-paused — it's the only tick that can judge a silent failed resume
+  (TIDAL API down produces neither progress nor a bus error).
+
 ## Assumptions
 
 - GStreamer's position query is frozen while `playbin3` is buffering or while
   the source is waiting for data; a changing position is a reliable "audio is
   moving" signal. (If a sink keeps the position advancing through an underrun,
   the buffering-staleness check still catches the dead stream.)
+- A uridecodebin with `use-buffering` prerolls (and buffers to its
+  buffer-duration) while the pipeline is PAUSED, so a stall resume's fresh
+  stream fills its buffer before its stream-start fires.
 - `souphttpsrc`/DASH network failures surface either as a BUS ERROR or as a
   silent stall; both paths are covered.
 - `track.get_stream()` blocks the worker thread on network access, so a
