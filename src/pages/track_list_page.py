@@ -99,7 +99,11 @@ class TrackListPage(Page):
 
         image = builder.get_object("_image")
         if getattr(self, "item", None):
-            threading.Thread(target=utils.add_image, args=(image, self.item)).start()
+            threading.Thread(
+                daemon=True,
+                target=utils.add_image,
+                args=(image, self.item),
+            ).start()
 
         sort_dropdown = builder.get_object("_sort_by_dropdown")
         sort_dropdown.connect("notify::selected", self.on_sort_changed)

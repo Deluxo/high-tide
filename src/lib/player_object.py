@@ -18,7 +18,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import logging
+import os
 import random
+import signal
+import subprocess
 import threading
 import time
 import base64
@@ -88,22 +91,6 @@ class PlayerObject(GObject.GObject):
 
         self.pipeline = Gst.Pipeline.new("dash-player")
 
-        self.playbin = Gst.ElementFactory.make("playbin3", "playbin")
-        if self.playbin:
-            self.playbin.connect("about-to-finish", self.play_next_gapless)
-            self.gapless_enabled = True
-        else:
-            logger.error("Could not create playbin3 element, trying playbin...")
-            self.playbin = Gst.ElementFactory.make("playbin", "playbin")
-            self.gapless_enabled = False
-
-        if preferred_sink == AudioSink.PIPEWIRE:
-            self.gapless_enabled = False
-
-        self.use_about_to_finish = True
-
-        self.pipeline.add(self.playbin)
-
         self.normalize = normalize
         self.quadratic_volume = quadratic_volume
         self.most_recent_rg_tags = ""
@@ -111,8 +98,42 @@ class PlayerObject(GObject.GObject):
         self.discord_rpc_enabled = True
 
         self.alsa_device: str = alsa_device
-        # Configure audio sink
-        self._setup_audio_sink(preferred_sink)
+        # the user volume, applied to the pipeline's volume element
+        self._user_volume = 1.0
+        # the uri of the playing track: a data: URI for streams, file:// for
+        # the music cache
+        self.current_uri = ""
+
+        # the armed next branch (uridecodebin, its branch queue, and the
+        # concat sink pad it's linked into), and its uri
+        self.next_uridecodebin: Any | None = None
+        self.next_branch_queue: Any | None = None
+        self._next_concat_sink: Any | None = None
+        self.next_uri = ""
+        # the next track's stream and manifest, applied when it starts
+        self.next_stream: Any | None = None
+        self.next_manifest: Any | None = None
+        # a next branch is being attached and prerolled on a worker thread
+        self._arming_next = False
+        # the branch's uridecodebin while it prerolls, for bus-message
+        # attribution before it is promoted to "armed"
+        self._arming_branch_element: Any | None = None
+        # bumped to invalidate an in-flight arm
+        self._arm_token = 0
+        # fires of concat's notify::active-pad, to suppress the first one
+        self._active_pad_fires = 0
+        # branches dropped on purpose, and until when their late bus messages
+        # are still attributed to them (a failing arm posts its errors just
+        # before it's detached)
+        self._dropped_branches: list[tuple[Any, float]] = []
+
+        # Build the playback pipeline (see _build_pipeline)
+        self._build_pipeline(preferred_sink)
+
+        # Gapless: the next track is a second uridecodebin branch on the
+        # concat, prerolled while the current track plays; at the boundary
+        # the concat's active pad switches to it (notify::active-pad)
+        self.gapless_enabled = preferred_sink != AudioSink.PIPEWIRE
 
         # Set up message bus
         self._bus = self.pipeline.get_bus()
@@ -143,46 +164,54 @@ class PlayerObject(GObject.GObject):
         self.update_timer: Any | None = None
         self.seek_after_sink_reload: int | None = None
         self.seeked_to_end = False
-
-        # stream stall detection and auto-recovery: pause when the buffer
-        # runs dry and no data comes from the server, then reconnect with
-        # fresh stream urls at the position where it stalled
-        self._current_uri: str = ""
-        # True when playing a fully cached local file (no network stream to
-        # refresh); an MPD manifest is a local file but its segments are not
-        self._current_uri_is_local: bool = False
-        self._last_position: int = 0
-        self._progress_at: float = time.monotonic()
-        self._buffer_percent: int = -1
-        self._buffer_changed_at: float = time.monotonic()
-        self._stall_paused: bool = False
-        self._stall_position: int = 0
-        self._stall_track_id: int | None = None
-        self._retry_attempts: int = 0
-        self._retry_timer: Any | None = None
-        self._resume_at: float = 0.0
-        self._retrying: bool = False
-        # counts track load requests so a stale url fetch (superseded by a
-        # user action during a stall retry) is dropped before it hits playbin
-        self._load_seq: int = 0
-
-        # how long without position progress counts as a stall, and how
-        # long the buffer may stop growing before it is considered dead
-        self.STALL_AFTER: float = 3.0
-        # a track that never started playing gets a longer grace period,
-        # so a slow initial buffer is not mistaken for a dead stream
-        self.START_STALL_AFTER: float = 10.0
-        self.BUFFER_DEAD_FOR: float = 3.0
-        self.RETRY_DELAYS: tuple[int, ...] = (3, 6, 12)
-        self.MAX_STALL_RETRIES: int = 3
-        # a retry that stays healthy for this long clears the retry budget
-        self.HEALTHY_AFTER: float = 30.0
+        self.last_stream_reload: int = 0
+        # when the uri of the playing track was loaded, its stream urls expire after
+        # about an hour (wall-clock time, to count time spent suspended)
+        self.stream_loaded_at: float = 0
+        # to notice when the stream of the playing track gets stuck
+        self.last_position: int | None = None
+        self.position_stuck_since: float = 0.0
+        # how many times a stuck stream has been reconnected (reset on progress)
+        self.stream_reconnects: int = 0
+        self.MAX_STREAM_RECONNECTS: int = 5
+        # the last observed buffering level and when it last grew, to tell a slow
+        # download (buffer growing, leave it alone) from a dead connection
+        self.last_buffer_per: int = -1
+        self.buffer_grew_since: float = 0.0
+        self.BUFFER_DEAD_FOR: float = 30.0
+        # a stream that hasn't started playing within this long is too slow;
+        # reconnect to try a faster edge instead of buffering forever
+        self.MAX_STREAM_LOAD: float = 60.0
+        self.stream_load_started: float = 0.0
+        # where the last seek went, as the position can't be queried until it's done
+        self.last_seek_position: int | None = None
 
         # next track variables for gapless
         self.next_track: Any | None = None
+        # id of the track whose stream is being prefetched, to avoid
+        # double-fetching
+        self.prefetch_id: int | None = None
+        # a gapless track is being loaded
+        self.loading_gapless = False
+        # the last track requested for gapless playback, dropped if another track
+        # is played directly while it loads
+        self.gapless_request: Track | None = None
 
         # for not caching on metered networks
         self.monitor = Gio.NetworkMonitor.get_default()
+
+        # music cache: tracks get queued as they play, and the download only
+        # runs while playback isn't using the network, so it doesn't starve
+        # the stream of bandwidth
+        self._cache_queue: List[Track] = []
+        self._cache_queued_ids: set = set()
+        self._cache_thread: threading.Thread | None = None
+        self._cache_lock = threading.Lock()
+        # the ffmpeg process of the running cache download, so it can be
+        # stopped on quit instead of being orphaned
+        self._cache_process: subprocess.Popen | None = None
+
+        self._clean_stale_manifests()
 
     @GObject.Property(type=bool, default=False)
     def playing(self) -> bool:
@@ -216,49 +245,410 @@ class PlayerObject(GObject.GObject):
         self._repeat_type = _repeat_type
         self.notify("repeat-type")
 
-    def _setup_audio_sink(self, sink_type: AudioSink) -> None:
-        """Configure the audio sink using parse_launch for simplicity."""
-        sink_map = {
+    def _build_pipeline(self, sink_type: AudioSink) -> None:
+        """Build the playback pipeline.
+
+        sone-style: uridecodebin → queue (15s) → concat → [replaygain] →
+        audioconvert → audioresample → volume → sink.
+
+        The decodebin's src pad is linked dynamically into the branch queue
+        (it only exists once the source starts); `concat` sits at the head so
+        a second branch can be attached for gapless playback later — with a
+        single sink pad it's a passthrough.
+        """
+        # Drop the armed next branch, if any: its elements are about to be
+        # removed from the pipeline along with everything else
+        self._detach_armed_next()
+
+        # Snapshot the children: removing while indexing shifts the indices
+        children = [
+            self.pipeline.get_child_by_index(i)
+            for i in range(self.pipeline.get_children_count())
+        ]
+        for child in children:
+            self.pipeline.remove(child)
+
+        sink_name = {
             AudioSink.AUTO: "autoaudiosink",
             AudioSink.PULSE: "pulsesink",
-            AudioSink.ALSA: f"alsasink device={self.alsa_device}",
+            AudioSink.ALSA: "alsasink",
             AudioSink.JACK: "jackaudiosink",
             AudioSink.OSS: "osssink",
             AudioSink.PIPEWIRE: "pipewiresink",
-        }
+        }.get(sink_type, "autoaudiosink")
+        sink = Gst.ElementFactory.make(sink_name, "sink")
+        if sink_name == "alsasink":
+            sink.set_property("device", self.alsa_device)
+        if not sink:
+            logger.error(f"Failed to create the {sink_name} sink")
+            return
 
-        sink_name = sink_map.get(sink_type, "autoaudiosink")
+        self.uridecodebin = Gst.ElementFactory.make("uridecodebin", "uridecodebin")
+        self.branch_queue = Gst.ElementFactory.make("queue", "branch-queue")
+        self.concat = Gst.ElementFactory.make("concat", "gapless-concat")
+        audioconvert = Gst.ElementFactory.make("audioconvert", None)
+        audioresample = Gst.ElementFactory.make("audioresample", None)
+        self.volume = Gst.ElementFactory.make("volume", None)
 
-        # add normalization to pipeline if set by settings
-        normalization = ""
+        # 15s of decoded reservoir ahead of the concat: a cushion against slow
+        # CDN edges (the queue defaults to one second, too little for hi-res)
+        self.branch_queue.set_property("max-size-time", 15 * Gst.SECOND)
+        self.branch_queue.set_property("max-size-buffers", 0)
+        self.branch_queue.set_property("max-size-bytes", 0)
+
+        # The signal chain after the concat; replaygain is inserted between
+        # the convert and the resample, as before
+        chain = [self.concat, audioconvert]
+        self.rgtags = None
         if self.normalize:
             # the pre-amp value is set to match tidal webs volume
-            normalization = (
-                f"taginject name=rgtags {self.most_recent_rg_tags} ! "
-                f"rgvolume name=rgvol pre-amp=4.0 fallback-gain=-10 headroom=6.0 ! "
-                f"rglimiter ! audioconvert !"
-            )
+            self.rgtags = Gst.ElementFactory.make("taginject", "rgtags")
+            rgvolume = Gst.ElementFactory.make("rgvolume", None)
+            rglimiter = Gst.ElementFactory.make("rglimiter", None)
+            rgconvert = Gst.ElementFactory.make("audioconvert", None)
+            rgvolume.set_property("pre-amp", 4.0)
+            rgvolume.set_property("fallback-gain", -10.0)
+            rgvolume.set_property("headroom", 6.0)
+            chain += [self.rgtags, rgvolume, rglimiter, rgconvert]
+        chain += [audioresample, self.volume, sink]
 
-        pipeline_str = (
-            f"queue ! audioconvert ! {normalization} audioresample ! {sink_name}"
+        elements = [self.uridecodebin, self.branch_queue, *chain]
+        if not all(elements):
+            logger.error("Failed to create a pipeline element")
+            return
+        for element in elements:
+            self.pipeline.add(element)
+        for first, second in zip(chain, chain[1:]):
+            if not first.link(second):
+                logger.error(f"Failed to link {first} to {second}")
+
+        # The concat switches to a newly linked sink pad on the current one's
+        # EOS. Connect before requesting sink_0: gstconcat fires notify
+        # synchronously inside request_pad when there is no active pad yet,
+        # and the handler suppresses that first fire
+        self._active_pad_fires = 0
+        self.concat.connect("notify::active-pad", self._on_concat_active_pad)
+
+        # Link the branch queue into the concat's first (and only) sink pad
+        self._current_concat_sink = self.concat.request_pad_simple("sink_%u")
+        queue_src = self.branch_queue.get_static_pad("src")
+        if self._current_concat_sink and queue_src:
+            queue_src.link(self._current_concat_sink)
+
+        self.volume.set_property("volume", self._user_volume)
+        if self.rgtags:
+            self.rgtags.set_property("tags", self.most_recent_rg_tags)
+
+        # uridecodebin creates its src pad when the source starts; link it
+        # into the branch queue from the pad-added signal
+        self.uridecodebin.connect(
+            "pad-added",
+            lambda decodebin, src_pad: self._on_decodebin_pad_added(
+                decodebin, src_pad, self.branch_queue
+            ),
         )
 
-        if sink_type == AudioSink.PIPEWIRE:
-            self.gapless_enabled = False
+        # Restore the playing track's uri across a sink change
+        if self.current_uri:
+            self._set_uri(self.current_uri)
+
+    def _on_decodebin_pad_added(
+        self, decodebin: Any, src_pad: Any, branch_queue: Any
+    ) -> None:
+        """Link the decodebin's src pad into its branch queue.
+
+        Args:
+            decodebin: required by Gst
+            src_pad: the newly created src pad
+            branch_queue: the branch queue to link into
+        """
+        sink_pad = branch_queue.get_static_pad("sink")
+        if sink_pad is None or sink_pad.is_linked():
+            return
+        # A decodebin can create a video pad too; only audio goes on
+        caps = src_pad.get_current_caps()
+        if caps:
+            structure = caps.get_structure(0)
+            if not structure.get_name().startswith("audio/"):
+                return
+        src_pad.link(sink_pad)
+
+    def _set_uri(self, uri: str) -> None:
+        """Set the decodebin's uri and its buffering time.
+
+        DASH (data: URIs) buffers 15s of compressed fragments ahead, plain
+        streams 5s, like sone does.
+        """
+        if uri.startswith("data:application/dash"):
+            buffer_ns = 15 * Gst.SECOND
         else:
-            self.gapless_enabled = True
+            buffer_ns = 5 * Gst.SECOND
+        self.uridecodebin.set_property("buffer-duration", buffer_ns)
+        self.uridecodebin.set_property("use-buffering", True)
+        self.uridecodebin.set_property("uri", uri)
+        self.current_uri = uri
 
-        try:
-            audio_bin = Gst.parse_bin_from_description(pipeline_str, True)
-            if not audio_bin:
-                raise RuntimeError("Failed to create audio bin")
+    def _detach_branch(
+        self, udb: Any, branch_queue: Any, concat_sink: Any
+    ) -> None:
+        """Detach a decodebin branch from the pipeline.
 
-            self.playbin.set_property("audio-sink", audio_bin)
-        except GLib.Error:
-            logger.exception("Error creating pipeline")
-            self.playbin.set_property(
-                "audio-sink", Gst.ElementFactory.make("autoaudiosink", None)
+        The branch queue's src is unlinked from the concat and the concat's
+        request pad is released BEFORE the branch goes NULL: the branch is
+        linked to a (possibly inactive) concat sink pad, which concat
+        hard-blocks, and nulling the branch while it's still linked would
+        hang the NULL transition on a live network source.
+        """
+        queue_src = branch_queue.get_static_pad("src")
+        if queue_src is not None:
+            # gst_pad_unlink takes the peer pad as an argument
+            peer = queue_src.get_peer()
+            if peer is not None:
+                queue_src.unlink(peer)
+        self.concat.release_request_pad(concat_sink)
+        # Keep the branch's late bus messages (an error that failed the
+        # preroll is posted right before this) attributed to the branch
+        self._remember_dropped_branch(udb)
+        # Drive both to NULL and block until the transitions complete:
+        # removing an element still mid-transition disposes it in a non-NULL
+        # state
+        udb.set_state(Gst.State.NULL)
+        branch_queue.set_state(Gst.State.NULL)
+        udb.get_state(10 * Gst.SECOND)
+        branch_queue.get_state(10 * Gst.SECOND)
+        self.pipeline.remove(udb)
+        self.pipeline.remove(branch_queue)
+
+    def _detach_armed_next(self) -> None:
+        """Detach the armed next branch, if any, and clear its state."""
+        if self.next_uridecodebin is not None:
+            self._detach_branch(
+                self.next_uridecodebin,
+                self.next_branch_queue,
+                self._next_concat_sink,
             )
+        self.next_uridecodebin = None
+        self.next_branch_queue = None
+        self._next_concat_sink = None
+        self.next_uri = ""
+        self.next_stream = None
+        self.next_manifest = None
+        self._cancel_arm()
+
+    def _cancel_arm(self) -> None:
+        """Cancel an in-flight arm; its worker drops the branch it attached."""
+        self._arm_token += 1
+        self._arming_next = False
+
+    def _repair_pipeline_state(self) -> None:
+        """Restore the pipeline after a branch failed its state change.
+
+        A child that fails an explicit state change leaves the parent's
+        state bookkeeping failed and PAUSED, and the pipeline then drops
+        the EOS that ends the current track. Asking for PLAYING again
+        rebuilds it. Runs on the main thread so it can't race play() or
+        pause().
+        """
+        GLib.idle_add(self._restore_pipeline_state)
+
+    def _restore_pipeline_state(self) -> None:
+        if not self.playing:
+            return
+        logger.info("Restoring the pipeline state after a failed next branch")
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def _arm_next_track(
+        self, track: Track, stream: Any, manifest: Any, url: str
+    ) -> None:
+        """Attach the prefetched next track as a second branch on the concat.
+
+        Runs on the main thread; the attach and preroll block, so they run on
+        a worker thread that can't block the GLib main loop.
+        """
+        if self._arming_next or self.next_uridecodebin is not None:
+            return
+        if track is not self._peek_next_track():
+            logger.info(f"Not arming {track.id}: it's not the next track anymore")
+            return
+        self._arming_next = True
+        self._arm_token += 1
+        threading.Thread(
+            daemon=True,
+            target=self._arm_next_track_thread,
+            args=(track, stream, manifest, url, self._arm_token),
+        ).start()
+
+    def _arm_next_track_thread(
+        self, track: Track, stream: Any, manifest: Any, url: str, token: int
+    ) -> None:
+        """Create and preroll the next branch (runs on a worker thread).
+
+        Like sone: preroll to PAUSED and block until the preroll settles, so
+        the decodebin's src pad is linked into the branch queue before any
+        buffer moves (going straight to PLAYING lets the demuxer push its
+        first buffer into an unlinked pad, `not-linked`), then promote to
+        PLAYING. The concat back-pressures the inactive sink pad, so the
+        branch holds prerolled and switches in gap-free at the EOS.
+        """
+        udb = Gst.ElementFactory.make("uridecodebin", None)
+        # Attribute its bus messages to the branch before it is armed
+        self._arming_branch_element = udb
+        udb.set_property("uri", url)
+        # 15s of compressed buffer: the branch has the rest of the current
+        # track as lead time to fill it
+        udb.set_property("buffer-duration", 15 * Gst.SECOND)
+        udb.set_property("use-buffering", True)
+        branch_queue = Gst.ElementFactory.make("queue", None)
+        branch_queue.set_property("max-size-time", 15 * Gst.SECOND)
+        branch_queue.set_property("max-size-buffers", 0)
+        branch_queue.set_property("max-size-bytes", 0)
+
+        self.pipeline.add(udb)
+        self.pipeline.add(branch_queue)
+
+        # Link the branch queue into the concat's next sink pad (sink_1)
+        concat_sink = self.concat.request_pad_simple("sink_%u")
+        queue_src = branch_queue.get_static_pad("src")
+        if concat_sink is None or queue_src is None:
+            logger.error("Failed to request the concat's next sink pad")
+            self.pipeline.remove(udb)
+            self.pipeline.remove(branch_queue)
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            if self._arm_token == token:
+                self._arming_next = False
+            return
+        queue_src.link(concat_sink)
+
+        # The decodebin's src pad links into the branch queue when it appears
+        udb.connect(
+            "pad-added",
+            lambda decodebin, src_pad: self._on_decodebin_pad_added(
+                decodebin, src_pad, branch_queue
+            ),
+        )
+
+        # Preroll to PAUSED and block until it settles (bounded, so a stalled
+        # network source can't hang this thread)
+        branch_queue.set_state(Gst.State.PAUSED)
+        udb.set_state(Gst.State.PAUSED)
+        preroll_ret, _state, _pending = udb.get_state(15 * Gst.SECOND)
+        # The preroll must have completed, and a directly played track must
+        # not have superseded this arm (it drops the branch and re-uris the
+        # pipeline itself); otherwise drop the branch
+        superseded = token != self._arm_token
+        if superseded or preroll_ret != Gst.StateChangeReturn.SUCCESS:
+            if preroll_ret != Gst.StateChangeReturn.SUCCESS:
+                logger.warning(f"Next branch failed to preroll: {preroll_ret}")
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            self._detach_branch(udb, branch_queue, concat_sink)
+            if not superseded and preroll_ret != Gst.StateChangeReturn.SUCCESS:
+                # A failed child state change leaves the pipeline unable to
+                # report EOS, which would freeze the current track at its end
+                self._repair_pipeline_state()
+            if not superseded:
+                self._arming_next = False
+            return
+        # Preroll done + pad linked: promote to PLAYING
+        promoted = branch_queue.sync_state_with_parent()
+        promoted = udb.sync_state_with_parent() and promoted
+        if not promoted:
+            logger.warning("Next branch failed to start playing")
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            self._detach_branch(udb, branch_queue, concat_sink)
+            self._repair_pipeline_state()
+            if token == self._arm_token:
+                self._arming_next = False
+            return
+        if token != self._arm_token:
+            # A direct play superseded the arm while it was promoting; nobody
+            # else knows about this branch, so drop it here
+            if self._arming_branch_element is udb:
+                self._arming_branch_element = None
+            self._detach_branch(udb, branch_queue, concat_sink)
+            return
+        self.next_uridecodebin = udb
+        self.next_branch_queue = branch_queue
+        self._next_concat_sink = concat_sink
+        self.next_uri = url
+        self.next_stream = stream
+        self.next_manifest = manifest
+        self.next_track = track
+        if self._arming_branch_element is udb:
+            self._arming_branch_element = None
+        self._arming_next = False
+        logger.info(f"Armed next track for gapless: {track.id}")
+
+    def _on_concat_active_pad(self, concat: Any, param_spec: Any) -> None:
+        """The concat switched its active sink pad.
+
+        The first fire is the initial link of sink_0 (suppressed). A switch to
+        the armed next branch's pad is a gapless advance; a switch to None is
+        the terminal EOS, handled by the pipeline's bus EOS message.
+        """
+        self._active_pad_fires += 1
+        if self._active_pad_fires == 1:
+            return
+        active_pad = self.concat.get_property("active-pad")
+        if active_pad is None:
+            return
+        # Only advance when the active pad is the armed next branch's
+        peer = active_pad.get_peer()
+        if peer is not None and peer.get_parent() is self.next_branch_queue:
+            GLib.idle_add(self._on_gapless_advance)
+
+    def _on_gapless_advance(self) -> None:
+        """The concat switched to the armed next branch: make it current."""
+        if self.next_uridecodebin is None:
+            return
+        # The old branch, to detach on a worker thread (the detach blocks on
+        # the NULL transition); the armed branch is promoted immediately so
+        # the main thread never sees a half-detached element
+        old = (self.uridecodebin, self.branch_queue, self._current_concat_sink)
+        self.uridecodebin = self.next_uridecodebin
+        self.branch_queue = self.next_branch_queue
+        self._current_concat_sink = self._next_concat_sink
+        self.current_uri = self.next_uri
+        self.stream = self.next_stream
+        self.manifest = self.next_manifest
+        playing_track = self.playing_track
+        self.next_uridecodebin = None
+        self.next_branch_queue = None
+        self._next_concat_sink = None
+        self.next_uri = ""
+        self.next_stream = None
+        self.next_manifest = None
+        self._arming_next = False
+        # The promoted track starts now: reset its buffer bookkeeping, as
+        # the direct-play path does
+        now = time.monotonic()
+        self.last_buffer_per = -1
+        self.buffer_grew_since = now
+        self.stream_load_started = now
+        # The armed track is playing now: take it out of the playlist. The
+        # advance doesn't go through play_next(), so without this it stays at
+        # the head of the list and plays again at its end
+        if self.next_track is not None:
+            self._consume_started_track(self.next_track)
+            self.can_go_next = len(self._tracks_to_play) > 0
+            self.notify("can-go-next")
+            self.emit("song-added-to-queue")
+
+        def detach_old():
+            self._detach_branch(*old)
+            GLib.idle_add(self._gapless_track_started, playing_track)
+
+        threading.Thread(daemon=True, target=detach_old).start()
+
+    def _gapless_track_started(self, playing_track) -> None:
+        """Update the UI once the old branch is fully detached."""
+        # Record the finished track
+        if playing_track is not None:
+            self.played_songs.append(playing_track)
+        # self.next_track is the armed track; set_track() picks it up
+        self._track_started()
 
     def change_audio_sink(self, sink_type: AudioSink) -> None:
         """Change the audio sink while maintaining playback state.
@@ -266,7 +656,6 @@ class PlayerObject(GObject.GObject):
         Args:
             sink_type (int): The audio sink `AudioSink` enum
         """
-        self.use_about_to_finish = False
         # Play the same track again after reload
         self.next_track = self.playing_track
         was_playing: bool = self.playing
@@ -274,23 +663,34 @@ class PlayerObject(GObject.GObject):
         duration: int = self.query_duration()
 
         self.pipeline.set_state(Gst.State.NULL)
-        self._setup_audio_sink(sink_type)
+        self._build_pipeline(sink_type)
 
         if was_playing and duration != 0:
             self.pipeline.set_state(Gst.State.PLAYING)
             self.seek_after_sink_reload = position / duration
-        self.use_about_to_finish = True
 
     def _on_bus_eos(self, *args) -> None:
-        """Handle end of stream."""
-        if not self.gapless_enabled:
-            GLib.idle_add(self.play_next)
-        elif not self.tracks_to_play and not self.queue:
-            self.pause()
+        """Handle end of stream: play the next track (or stop at the end)."""
+        self.play_next()
 
     def _on_bus_error(self, bus: Any, message: Any) -> None:
         """Handle pipeline errors."""
         err, debug = message.parse_error()
+        # An error inside the armed next branch mustn't stop the current
+        # track: drop that branch and let the current track's EOS fall back
+        # to a normal play_next()
+        if self._message_from_armed_branch(message):
+            logger.warning(f"Next branch error: {err.message}")
+            # The "state change failed" follow-up comes from this same source
+            self._remember_dropped_element(message.src)
+            if self._arming_next:
+                # Still prerolling: the arm worker drops what it attached (and
+                # restores the pipeline state; don't invalidate the arm here,
+                # that would tell it the failure doesn't need repairing)
+                self._arming_next = False
+            else:
+                self._detach_armed_next()
+            return
         logger.error(f"Error: {err.message}")
         logger.error(f"Debug info: {debug}")
 
@@ -308,18 +708,53 @@ class PlayerObject(GObject.GObject):
             utils.send_toast(_("ALSA Audio Device is not available"), 5)
             self.pause()
             self.pipeline.set_state(Gst.State.NULL)
-        elif self.playing:
-            # A dead connection or failed DASH segment leaves the pipeline
-            # unusable; pause and reconnect with fresh stream urls.
-            self._begin_stall()
+
+        # The stream URLs expire after a while (e.g. after a long pause or suspend),
+        # so reload the track to get new ones and continue from the same position
+        elif "Couldn't download fragments" in err.message:
+            now = GLib.get_monotonic_time()
+            if now - self.last_stream_reload < 30_000_000:
+                return
+            self.last_stream_reload = now
+
+            logger.error(
+                "Stream error: Couldn't download fragments. Reloading track..."
+            )
+            self._reload_track()
+
+    def _reload_track(self) -> None:
+        """Load the playing track again and continue from the same position"""
+        duration = self.query_duration()
+        if duration:
+            self.seek_after_sink_reload = self.query_position() / duration
+        self.play_track(self.playing_track)
+
+    def _stream_expires_soon(self) -> bool:
+        """Whether the stream urls of the playing track expire before it's downloaded"""
+        if not self.playing_track or not self.stream_loaded_at or self.next_track:
+            return False
+        if self.current_uri.startswith("file://"):
+            # Playing from the music cache
+            return False
+        # They last about an hour, but very long tracks would never finish in time,
+        # so only bother after at least a short pause
+        age = time.time() - self.stream_loaded_at
+        remaining = max(self.query_duration() - self.query_position(), 0) / Gst.SECOND
+        return age > 10 * 60 and age + remaining > 50 * 60
 
     def _on_buffering_message(self, bus: Any, message: Any) -> None:
+        # The armed next branch buffers in parallel; its messages mustn't
+        # drive the playing track's buffer state or spinner
+        if self._message_from_armed_branch(message):
+            self._remember_dropped_element(message.src)
+            return
         buffer_per: int = message.parse_buffering()
         mode, avg_in, avg_out, buff_left = message.parse_buffering_stats()
 
-        if buffer_per > self._buffer_percent:
-            self._buffer_changed_at = time.monotonic()
-        self._buffer_percent = buffer_per
+        if buffer_per > self.last_buffer_per:
+            # Data is arriving; a download is in progress
+            self.buffer_grew_since = time.monotonic()
+        self.last_buffer_per = buffer_per
 
         self.emit("buffering", buffer_per)
 
@@ -350,6 +785,80 @@ class PlayerObject(GObject.GObject):
         self.notify("can-go-next")
         self.emit("song-changed")
 
+    def _remember_dropped_element(self, element: Any) -> None:
+        """Remember a branch element whose late messages are still its own.
+
+        The elements inside a uridecodebin are unparented when it goes NULL,
+        so a late error's parent chain no longer leads to the branch; its
+        source element is remembered instead while messages are suppressed.
+        """
+        deadline = time.monotonic() + 5.0
+        for i, (known, _deadline) in enumerate(self._dropped_branches):
+            if known is element:
+                self._dropped_branches[i] = (element, deadline)
+                return
+        self._dropped_branches.append((element, deadline))
+
+    def _remember_dropped_branch(self, element: Any) -> None:
+        """Keep a dropped branch's late bus messages attributed to it."""
+        for child in self._branch_elements(element):
+            self._remember_dropped_element(child)
+
+    def _branch_elements(self, element: Any) -> list[Any]:
+        """All elements inside a branch element, for message attribution."""
+        elements = [element]
+        if isinstance(element, Gst.Bin):
+            for i in range(element.get_children_count()):
+                elements += self._branch_elements(element.get_child_by_index(i))
+        return elements
+
+    def _is_dropped_branch(self, element: Any) -> bool:
+        """Whether the element belongs to a branch that was just dropped."""
+        if not self._dropped_branches:
+            return False
+        now = time.monotonic()
+        self._dropped_branches = [
+            (e, deadline)
+            for (e, deadline) in self._dropped_branches
+            if deadline > now
+        ]
+        return any(e is element for (e, _deadline) in self._dropped_branches)
+
+    def _message_from_armed_branch(self, message: Any) -> bool:
+        """Whether a bus message came from a branch other than the playing one.
+
+        The armed branch — and a branch that was just dropped — shares the
+        pipeline's bus, so its stream-start, buffering and error messages
+        must not be mistaken for the playing track's.
+        """
+        obj = message.src
+        while obj is not None:
+            if obj is self.uridecodebin:
+                return False
+            if (
+                obj is self.next_uridecodebin
+                or obj is self._arming_branch_element
+                or self._is_dropped_branch(obj)
+            ):
+                return True
+            obj = obj.get_parent()
+        return False
+
+    def _stream_start_from_armed_branch(self) -> bool:
+        """Whether a stream-start belongs to the armed branch, not the playing one.
+
+        stream-start messages reach the bus with the pipeline as their source
+        (GstBin forwards them), so message.src can't identify the branch. A
+        branch is armed, prerolling, or the concat has already switched to it
+        while the advance is still queued: in all those cases the playing
+        track has already started, so the message isn't a new track.
+        """
+        if self.next_uridecodebin is not None or self._arming_next:
+            return True
+        active_pad = self.concat.get_property("active-pad")
+        peer = active_pad.get_peer() if active_pad is not None else None
+        return peer is not None and peer.get_parent() is self.next_branch_queue
+
     def _on_track_start(self, bus: Any, message: Any):
         """This Method is called when a new track starts playing
 
@@ -357,11 +866,29 @@ class PlayerObject(GObject.GObject):
             bus: required by Gst
             message: required by Gst
         """
+        # The armed next branch's source fires stream-start during its
+        # preroll; that track becomes current on the gapless advance, which
+        # updates the UI then. The message comes from the pipeline, so the
+        # branch is identified by the pipeline state instead of message.src.
+        if self._message_from_armed_branch(message):
+            # Its follow-up messages may arrive after the branch is dropped
+            self._remember_dropped_element(message.src)
+            return
+        if self._stream_start_from_armed_branch():
+            return
+        self._track_started()
+
+    def _track_started(self) -> None:
+        """A track has started playing: update the UI and do housekeeping."""
         # apply replaygain first to avoid volume clipping
         # (Idk if that will happen but its the only thing that has effect on audio in here)
         if self.stream:
             self.apply_replaygain_tags()
         self.set_track()
+        self.stream_loaded_at = time.time()
+
+        # Cache the track in the background, when it's safe to do so
+        self._queue_cache(self.playing_track)
 
         if self.discord_rpc_enabled and self.playing_track:
             discord_rpc.set_activity(self.playing_track, 0)
@@ -370,15 +897,11 @@ class PlayerObject(GObject.GObject):
             GLib.source_remove(self.update_timer)
         self.update_timer = GLib.timeout_add(1000, self._update_slider_callback)
 
-        # Fresh stream starts from a clean slate for the stall watchdog
-        self._last_position = 0
-        self._progress_at = time.monotonic()
-        self._buffer_changed_at = time.monotonic()
-        self._stall_paused = False
-
         self.seeked_to_end = False
+        self.last_seek_position = None
         if self.seek_after_sink_reload:
-            self.seek(self.seek_after_sink_reload)
+            # Continue exactly where it was, without repeating part of the track
+            self.seek(self.seek_after_sink_reload, accurate=True)
             self.seek_after_sink_reload = None
 
         self.can_go_prev = len(self.played_songs) > 0
@@ -388,20 +911,27 @@ class PlayerObject(GObject.GObject):
             GLib.timeout_add(2000, self.previous_timer_callback)
 
     def play_this(
-        self, thing: Union[Mix, Album, Playlist, List[Track], Track], index: int = 0
+        self,
+        thing: Union[Mix, Album, Playlist, List[Track], Track],
+        index: int = 0,
+        tracks: List[Track] | None = None,
     ) -> None:
         """Play tracks from a mix, album, playlist, or artist.
 
         Args:
             thing: An object (Mix, Album, Playlist, Artist, or list of Tracks) to play
             index (int): The index of the track to start playing (default: 0)
+            tracks: The tracks of thing, if already fetched (default: None)
         """
         self.current_mix_album_playlist = thing
-        tracks: List[Track] = self.get_track_list(thing)
+        if tracks is None:
+            tracks = self.get_track_list(thing)
 
         if not tracks:
             logger.info("No tracks found to play")
             return
+
+        self.id_list = [track.id for track in tracks]
 
         self._tracks_to_play = tracks[index:] + tracks[:index]
         if not self._tracks_to_play:
@@ -410,7 +940,7 @@ class PlayerObject(GObject.GObject):
         track: Track = self._tracks_to_play.pop(0)
 
         if not track.available:
-            self.play_this(thing, index + 1)
+            self.play_this(thing, index + 1, tracks)
         else:
             self.tracks_to_play = self._tracks_to_play
             self.played_songs = []
@@ -431,7 +961,7 @@ class PlayerObject(GObject.GObject):
             thing: An object (Mix, Album, Playlist, Artist, or list of Tracks) to play
         """
         tracks: List[Track] = self.get_track_list(thing)
-        self.play_this(thing, random.randint(0, len(tracks)))
+        self.play_this(thing, random.randint(0, len(tracks)), tracks)
         self.shuffle = True
 
     def get_track_list(
@@ -454,35 +984,23 @@ class PlayerObject(GObject.GObject):
         elif isinstance(thing, Playlist):
             tracks_list = thing.tracks()
         elif isinstance(thing, Artist):
-            tracks_list = thing.top_tracks()
+            tracks_list = thing.get_top_tracks()
         elif isinstance(thing, list):
             tracks_list = thing
         elif isinstance(thing, Track):
             tracks_list = [thing]
 
-        self.id_list = [track.id for track in tracks_list]
-
         return tracks_list
 
     def play(self) -> None:
         """Start playback of the current track."""
-        if self._stall_paused and not self._retrying and self.playing_track:
-            # The stream was dead when we paused; the old connection is
-            # likely still dead, so re-fetch urls and resume where it stalled.
-            # _stall_paused stays set until the fetch succeeds, so a failed
-            # fetch re-arms the retry from _play_track_thread
-            if self._retry_timer is not None:
-                GLib.source_remove(self._retry_timer)
-                self._retry_timer = None
-            self._retry_attempts = 0
-            duration = self.query_duration()
-            if duration > 0:
-                self.seek_after_sink_reload = self._stall_position / duration
-            self._retrying = True
-            self.play_track(self.playing_track)
-            return
-
         self.playing = True
+        if self._stream_expires_soon():
+            # Resuming after a long pause: get new stream urls (or play the track from
+            # the cache) now, instead of failing to download the rest of it
+            logger.info("Stream urls expire soon, reloading track")
+            self._reload_track()
+            return
         self.pipeline.set_state(Gst.State.PLAYING)
 
         if self.discord_rpc_enabled and self.playing_track:
@@ -498,6 +1016,9 @@ class PlayerObject(GObject.GObject):
         self.playing = False
         self.pipeline.set_state(Gst.State.PAUSED)
 
+        # Caching can now use the network
+        self._maybe_start_cache()
+
         if self.discord_rpc_enabled:
             discord_rpc.set_activity()
 
@@ -508,54 +1029,6 @@ class PlayerObject(GObject.GObject):
         else:
             self.play()
 
-    def _reset_stall(self) -> None:
-        """Clear all stall bookkeeping (user seeked or a new track is played)."""
-        if self._retry_timer is not None:
-            GLib.source_remove(self._retry_timer)
-            self._retry_timer = None
-        self._stall_paused = False
-        self._retrying = False
-        self._retry_attempts = 0
-        self.seek_after_sink_reload = None
-        self._last_position = 0
-        self._progress_at = time.monotonic()
-        self._buffer_changed_at = time.monotonic()
-
-    def _begin_stall(self) -> None:
-        """Pause playback because the stream of the playing track stalled."""
-        if self._stall_paused:
-            return
-        self._stall_position = max(0, self.query_position(default=0))
-        self._stall_track_id = self.playing_track.id if self.playing_track else None
-        self._stall_paused = True
-        self.pause()
-        utils.send_toast(_("Stream stalled, retrying…"), 3)
-        self._schedule_retry()
-
-    def _schedule_retry(self) -> None:
-        delay = self.RETRY_DELAYS[
-            min(self._retry_attempts, len(self.RETRY_DELAYS) - 1)
-        ]
-        self._retry_timer = GLib.timeout_add(int(delay * 1000), self._retry)
-
-    def _retry(self) -> bool:
-        """Reconnect with fresh stream urls and resume at the stall position."""
-        self._retry_timer = None
-        if not self._stall_paused or not self.playing_track:
-            return False
-        if self._retry_attempts >= self.MAX_STALL_RETRIES:
-            utils.send_toast(_("Playback paused: no data from TIDAL"), 5)
-            return False
-
-        self._retry_attempts += 1
-        self._resume_at = time.monotonic()
-        duration = self.query_duration()
-        if duration > 0:
-            self.seek_after_sink_reload = self._stall_position / duration
-        self._retrying = True
-        self.play_track(self.playing_track)
-        return False
-
     def play_track(self, track: Track, gapless=False) -> None:
         """Play a specific track immediately or enqueue it for gapless playback
 
@@ -563,129 +1036,265 @@ class PlayerObject(GObject.GObject):
             track: The Track object to play
             gapless: Whether to enqueue the track for gapless playback
         """
-        playing_id = self.playing_track.id if self.playing_track else None
-        if gapless or track.id != playing_id:
-            # A user-requested track (not our own retry) supersedes a stalled
-            # stream and its pending retry
-            self._reset_stall()
-        self._load_seq += 1
+        if gapless:
+            self.gapless_request = track
+            self.loading_gapless = True
         threading.Thread(
-            target=self._play_track_thread, args=(track, gapless, self._load_seq)
+            daemon=True,
+            target=self._play_track_thread,
+            args=(track, gapless),
         ).start()
 
-    def _play_track_thread(self, track: Track, gapless=False, seq: int = 0) -> None:
+    def _play_track_thread(self, track: Track, gapless=False) -> None:
         self.stream = None
         self.manifest = None
+
+        cached_music = self._cached_music_path(track)
+        if cached_music:
+            self._play_cached_track(track, cached_music, gapless)
+            return
 
         try:
             self.stream = track.get_stream()
             self.manifest = self.stream.get_stream_manifest()
-            urls = self.manifest.get_urls()
 
-            music_url, is_local = self._get_cached_or_stream_url(track, gapless)
+            music_url = self._get_cached_or_stream_url(track, gapless)
 
-            GLib.idle_add(self._play_track_url, track, music_url, gapless, seq, is_local)
+            GLib.idle_add(self._play_track_url, track, music_url, gapless)
         except Exception:
             logger.exception("Error getting track URL")
-            if self._retrying and seq == self._load_seq:
-                # The TIDAL API is unreachable; the stream we were retrying
-                # for can't be fetched, so try again after a cooldown
-                self._retrying = False
-                self._schedule_retry()
+            if gapless:
+                self.loading_gapless = False
+                if self.gapless_request is track:
+                    self.gapless_request = None
+
+    def _play_cached_track(self, track, cached_music, gapless=False) -> None:
+        """Play a track from the music cache.
+
+        Its stream info (ReplayGain, quality label) comes from TIDAL, but a slow or
+        missing connection (e.g. offline, which retries for minutes) shouldn't hold
+        up a track that's on disk, so it plays without it after a short wait.
+        """
+        info = {}
+
+        def get_info():
+            try:
+                stream = track.get_stream()
+                info["manifest"] = stream.get_stream_manifest()
+                info["stream"] = stream
+            except Exception:
+                logger.warning(f"Couldn't get the stream info of {track.id}")
+                return
+            if info.get("late"):
+                GLib.idle_add(self._set_late_stream_info, track, info)
+
+        thread = threading.Thread(target=get_info, daemon=True)
+        thread.start()
+        thread.join(2)
+        if "stream" in info:
+            self.stream, self.manifest = info["stream"], info["manifest"]
+        else:
+            info["late"] = True
+            logger.warning(f"Playing {track.id} from the music cache without its stream info")
+        logger.info(f"Playing from music cache: {track.id}")
+        GLib.idle_add(self._play_track_url, track, f"file://{cached_music}", gapless)
+
+    def _set_late_stream_info(self, track, info) -> None:
+        if self.playing_track is track and not self.stream:
+            self.stream, self.manifest = info["stream"], info["manifest"]
+            self.apply_replaygain_tags()
+
+    def _cached_music_path(self, track) -> Path | None:
+        """Get the track's file in the music cache, if it's there."""
+        if not track or not getattr(utils, "MUSIC_DIR", None):
+            return None
+        cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
+        return cached_music if cached_music.exists() else None
 
     def _get_cached_or_stream_url(self, track, gapless=False):
-        """Get URL from cache or stream, caching if not cached.
-
-        Returns:
-            tuple: (url, is_local), where is_local means the whole file is
-            on disk and there is no network stream behind it
-        """
-        if not hasattr(utils, 'MUSIC_DIR') or not utils.MUSIC_DIR:
-            return self._get_stream_url(track, gapless), False
-
-        cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
-
-        if cached_music.exists():
+        """Get URL from cache or stream, caching if not cached."""
+        cached_music = self._cached_music_path(track)
+        if cached_music:
             logger.info(f"Playing from music cache: {track.id}")
-            return f"file://{cached_music}", True
+            return f"file://{cached_music}"
 
-        return self._get_stream_url(track, gapless), False
+        return self._get_stream_url(track, self.stream, self.manifest, gapless)
 
-    def _get_stream_url(self, track, gapless=False):
-        """Get stream URL and start background caching."""
+    def _get_stream_url(self, track, stream, manifest, gapless=False):
+        """Get the stream URL and queue the track for caching."""
         if not gapless:
             self.apply_replaygain_tags()
 
-        if self.stream.manifest_mime_type == ManifestMimeType.MPD:
-            data = self.stream.get_manifest_data()
+        if stream.manifest_mime_type == ManifestMimeType.MPD:
+            data = stream.get_manifest_data()
             if not data:
                 raise AttributeError("No MPD manifest available!")
-
-            major, minor, micro, nano = Gst.version()
-            if (major, minor) >= (1, 26):
-                # Write manifest to temp location for GStreamer and caching
-                mpd_path = Path(utils.CACHE_DIR, "manifest.mpd")
-                with open(mpd_path, "w") as f:
-                    f.write(data)
-
-                if not self.monitor.get_network_metered():
-                    threading.Thread(
-                        target=self._cache_mpd_track,
-                        args=(track, mpd_path)
-                    ).start()
-
-                return f"file://{mpd_path}"
+            # The manifest is embedded in the uri (a self-contained data: URI,
+            # like sone does), so no manifest file is written to disk
+            if isinstance(data, str):
+                mpd_bytes = data.encode("utf-8")
             else:
-                if isinstance(data, str):
-                    mpd_bytes = data.encode("utf-8")
-                else:
-                    mpd_bytes = data
-                mpd_b64 = base64.b64encode(mpd_bytes).decode("ascii")
-                return "data:application/dash+xml;base64," + mpd_b64
+                mpd_bytes = data
+            mpd_b64 = base64.b64encode(mpd_bytes).decode("ascii")
+            self._queue_cache(track)
+            return "data:application/dash+xml;base64," + mpd_b64
 
-        elif self.stream.manifest_mime_type == ManifestMimeType.BTS:
-            urls = self.manifest.get_urls()
+        elif stream.manifest_mime_type == ManifestMimeType.BTS:
+            urls = manifest.get_urls()
             stream_url = urls[0] if isinstance(urls, list) else urls
 
-            if not self.monitor.get_network_metered():
-                threading.Thread(
-                    target=self._cache_bts_track,
-                    args=(track, stream_url)
-                ).start()
+            self._queue_cache(track)
 
             return stream_url
 
-        raise AttributeError(f"Unhandled manifest mime type: {self.stream.manifest_mime_type}")
+        raise AttributeError(
+            f"Unhandled manifest mime type: {stream.manifest_mime_type}"
+        )
+
+    def _queue_cache(self, track) -> None:
+        """Queue a track for caching.
+
+        The download only starts while playback isn't using the network, so
+        it doesn't compete with the stream for bandwidth.
+        """
+        if not track or not getattr(utils, "MUSIC_DIR", None):
+            return
+        if self._cached_music_path(track):
+            return
+        if self.monitor.get_network_metered():
+            return
+        with self._cache_lock:
+            if track.id in self._cache_queued_ids:
+                return
+            self._cache_queued_ids.add(track.id)
+            self._cache_queue.append(track)
+        self._maybe_start_cache()
+
+    def _playback_uses_network(self) -> bool:
+        """Whether playback is streaming, i.e. using the network.
+
+        A stream is a data: URI (a manifest whose segments are remote) or an
+        http(s) url. A plain file url is the music cache.
+        """
+        if not self.playing:
+            return False
+        return not self.current_uri.startswith("file://")
+
+    def _maybe_start_cache(self) -> None:
+        """Start caching the next queued track, if it's safe to do so."""
+        with self._cache_lock:
+            if self._cache_thread and self._cache_thread.is_alive():
+                return
+            if self._playback_uses_network():
+                return
+            if not self._cache_queue:
+                return
+            track = self._cache_queue.pop(0)
+            self._cache_queued_ids.discard(track.id)
+            self._cache_thread = threading.Thread(
+                daemon=True, target=self._cache_worker, args=(track,)
+            )
+            self._cache_thread.start()
+
+    def _cache_worker(self, track) -> None:
+        """Download a queued track into the music cache."""
+        try:
+            if self._cached_music_path(track):
+                return
+            # Fetch a fresh stream for caching, independent of the one that's
+            # playing
+            stream = track.get_stream()
+            manifest = stream.get_stream_manifest()
+            if stream.manifest_mime_type == ManifestMimeType.MPD:
+                data = stream.get_manifest_data()
+                if not data:
+                    return
+                mpd_path = Path(utils.CACHE_DIR, f"manifest_cache_{track.id}.mpd")
+                with open(mpd_path, "w") as f:
+                    f.write(data)
+                try:
+                    self._cache_mpd_track(track, mpd_path)
+                finally:
+                    mpd_path.unlink(missing_ok=True)
+            elif stream.manifest_mime_type == ManifestMimeType.BTS:
+                urls = manifest.get_urls()
+                stream_url = urls[0] if isinstance(urls, list) else urls
+                self._cache_bts_track(track, stream_url)
+        except Exception:
+            logger.exception(f"Error caching track {track.id}")
+        finally:
+            with self._cache_lock:
+                self._cache_thread = None
+            # Continue with the next queued track, if it's safe to do so
+            GLib.idle_add(self._maybe_start_cache)
 
     def _cache_mpd_track(self, track, mpd_path):
-        """Download and cache MPD track via ffmpeg in background."""
+        """Download and cache MPD track via ffmpeg in background.
+
+        The download is paused while playback is streaming, so it doesn't
+        compete with it for bandwidth.
+        """
         cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
         tmp = cached_music.with_suffix(".tmp")
 
         try:
-            import subprocess
             logger.info(f"Caching MPD track: {track.id}")
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "ffmpeg",
+                    # Leave the terminal alone when started from one: reading it from
+                    # the sandbox's background process group stops the whole app
+                    "-nostdin",
                     "-protocol_whitelist", "file,crypto,data,http,https,tcp,tls",
                     "-i", str(mpd_path),
                     "-f", "mp4",
                     "-c", "copy",
                     "-y", str(tmp)
                 ],
-                capture_output=True
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
+            self._cache_process = proc
+            try:
+                self._pause_cache_while_streaming(proc)
+            finally:
+                self._cache_process = None
 
-            if result.returncode == 0:
+            stderr = proc.stderr.read()
+            proc.stderr.close()
+
+            if proc.returncode == 0:
                 tmp.rename(cached_music)
                 logger.info(f"Cached MPD track: {track.id}")
             else:
-                logger.warning(f"ffmpeg failed for {track.id}: {result.stderr.decode()}")
+                logger.warning(
+                    f"ffmpeg failed for {track.id}: {stderr.decode(errors='replace')}"
+                )
                 tmp.unlink(missing_ok=True)
         except Exception as e:
             logger.warning(f"Failed to cache MPD track {track.id}: {e}")
             tmp.unlink(missing_ok=True)
+
+    def _pause_cache_while_streaming(self, proc) -> None:
+        """Pause the cache download while playback is streaming.
+
+        TIDAL throttles per connection, so a cache download running in
+        parallel with a stream can starve it. ffmpeg is stopped and resumed
+        at the OS level, so the progress is kept.
+        """
+        paused = False
+        while proc.poll() is None:
+            streaming = self._playback_uses_network()
+            if streaming and not paused:
+                os.kill(proc.pid, signal.SIGSTOP)
+                paused = True
+                logger.info("Pausing track caching while streaming")
+            elif not streaming and paused:
+                os.kill(proc.pid, signal.SIGCONT)
+                paused = False
+                logger.info("Resuming track caching")
+            time.sleep(0.5)
 
     def _cache_bts_track(self, track, stream_url):
         """Download and cache BTS track in background."""
@@ -699,6 +1308,10 @@ class PlayerObject(GObject.GObject):
             if response.status_code == 200:
                 with open(tmp, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
+                        # Pause the download while playback is streaming, so it
+                        # doesn't compete with it for bandwidth
+                        while self._playback_uses_network():
+                            time.sleep(1)
                         f.write(chunk)
                 tmp.rename(cached_music)
                 logger.info(f"Cached BTS track: {track.id}")
@@ -708,12 +1321,41 @@ class PlayerObject(GObject.GObject):
             logger.warning(f"Failed to cache BTS track {track.id}: {e}")
             tmp.unlink(missing_ok=True)
 
+    def _clean_stale_manifests(self) -> None:
+        """Remove manifest files from previous sessions.
+
+        They're only needed while their track is playing or being cached.
+        """
+        try:
+            for manifest in Path(utils.CACHE_DIR).glob("manifest_*.mpd"):
+                if time.time() - manifest.stat().st_mtime > 24 * 3600:
+                    manifest.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Error cleaning stale manifests")
+
+    def shutdown(self) -> None:
+        """Stop any running downloads, if any are running.
+
+        The download threads are daemon, so quitting the app would otherwise
+        leave ffmpeg running as an orphan.
+        """
+        proc = self._cache_process
+        if proc and proc.poll() is None:
+            # If it was stopped while streaming, wake it so the terminate
+            # below isn't deferred until the process would resume on its own
+            try:
+                os.kill(proc.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
     def apply_replaygain_tags(self):
         """Apply ReplayGain normalization tags to the current track if enabled."""
-        audio_sink = self.playbin.get_property("audio-sink")
-
-        if audio_sink:
-            rgtags = audio_sink.get_by_name("rgtags")
+        rgtags = self.rgtags
 
         tags = ""
 
@@ -738,51 +1380,102 @@ class PlayerObject(GObject.GObject):
         # toggling the option
         self.most_recent_rg_tags = f"tags={tags}"
 
-    def _play_track_url(self, track, music_url, gapless=False, seq: int = 0,
-                        is_local: bool = False):
+    def _play_track_url(self, track, music_url, gapless=False):
         """Set up and play track from URL."""
-        # The user started a different track (or seeked) while this url was
-        # being fetched; drop it so it can't race the newer request
-        if not gapless and seq != self._load_seq:
+        if gapless:
+            if track is not self.gapless_request:
+                logger.info(
+                    f"Dropping gapless track {track.id}: another track was played"
+                )
+                return
+            self.gapless_request = None
+            self.loading_gapless = False
+        if gapless:
+            # Arm the next branch on the concat; the current track keeps
+            # playing and the concat switches to it at its EOS
+            self._arm_next_track(track, self.stream, self.manifest, music_url)
             return
-
-        if not gapless:
-            self.use_about_to_finish = False
-            self.pipeline.set_state(Gst.State.NULL)
-            self.playbin.set_property("volume", self.playbin.get_property("volume"))
-        self.playbin.set_property("uri", music_url)
-        self._current_uri = music_url
-        self._current_uri_is_local = is_local
+        # A track played directly replaces the one queued for gapless playback,
+        # which would otherwise be shown as playing when this one starts
+        self.gapless_request = None
+        self.next_track = None
+        self.pipeline.set_state(Gst.State.NULL)
+        # A directly played track replaces the armed next branch
+        self._detach_armed_next()
+        self._set_uri(music_url)
 
         logger.info(music_url)
 
-        if gapless:
-            self.next_track = track
-        else:
-            self.set_track(track)
+        self.set_track(track)
+        self.stream_loaded_at = time.time()
+        # A fresh stream starts downloading from an empty buffer
+        self.last_buffer_per = -1
+        now = time.monotonic()
+        self.buffer_grew_since = now
+        self.stream_load_started = now
 
-        if not gapless and (self.playing or self._retrying):
-            # Stay paused until the urls were fetched, then start; the seek
-            # to the stall position is applied in _on_track_start
-            self._retrying = False
-            self._stall_paused = False
+        if self.playing:
             self.play()
 
-        if not gapless:
-            self.use_about_to_finish = True
+    def _consume_started_track(self, track: Track) -> None:
+        """Take a track out of what play_next() would play, now that it plays.
 
-    def play_next_gapless(self, playbin: Any):
-        """Enqueue the next track for gapless playback.
-
-        Args:
-            playbin: required by Gst
+        play_next() removes the track it plays from the queue or the playlist;
+        a gapless advance promotes an armed track without going through it, so
+        the same has to happen here — otherwise the track stays at the head of
+        the list and plays again at its end.
         """
-        # playbin is need as arg but we access it later over self
-        if self.gapless_enabled and self.use_about_to_finish and self.tracks_to_play:
-            GLib.idle_add(self.play_next, True)
-            logger.info("Trying gapless playbck")
+        if self.queue and self.queue[0] is track:
+            self.queue.pop(0)
+            return
+        track_list = (
+            self._shuffled_tracks_to_play if self.shuffle else self._tracks_to_play
+        )
+        for index, candidate in enumerate(track_list):
+            if candidate is track:
+                # In place: tracks_to_play aliases whichever list this is
+                del track_list[index]
+                return
+
+    def _peek_next_track(self) -> Track | None:
+        """Get the track play_next(gapless=True) would play, without removing it"""
+        if self._repeat_type == RepeatType.SONG:
+            return self.playing_track
+        if self.queue:
+            return self.queue[0]
+        if self.shuffle:
+            track_list = self._shuffled_tracks_to_play
         else:
-            logger.info("Ignoring about to finish event")
+            track_list = self._tracks_to_play
+        return track_list[0] if track_list else None
+
+    def _prefetch_next_track(self) -> None:
+        """Fetch the stream of the next track in the background"""
+        if self.next_track or self.loading_gapless:
+            return
+        if not self.tracks_to_play:
+            return
+        track = self._peek_next_track()
+        if not track or track.id == self.prefetch_id:
+            return
+        self.prefetch_id = track.id
+        threading.Thread(
+            daemon=True,
+            target=self._prefetch_thread,
+            args=(track,),
+        ).start()
+
+    def _prefetch_thread(self, track: Track) -> None:
+        try:
+            stream = track.get_stream()
+            manifest = stream.get_stream_manifest()
+            logger.info(f"Prefetched stream: {track.id}")
+            # Arm the next branch on the concat, so the track is prerolled
+            # and can start gap-free when the current one ends
+            url = self._get_stream_url(track, stream, manifest, gapless=True)
+            GLib.idle_add(self._arm_next_track, track, stream, manifest, url)
+        except Exception:
+            logger.exception("Error prefetching track stream")
 
     def play_next(self, gapless=False):
         """Play the next track in the queue or playlist.
@@ -791,11 +1484,13 @@ class PlayerObject(GObject.GObject):
             gapless: Whether to enqueue the track in gapless mode
         """
 
-        # A track is already enqueued from an about-to-finish
+        # A track is already armed for gapless playback
         if self.next_track:
-            logger.info("Using already enqueued track from gapless")
+            logger.info("Using already armed track from gapless")
             track = self.next_track
             self.next_track = None
+            # It plays now, so consume it like the branches below do
+            self._consume_started_track(track)
             self.play_track(track, gapless=gapless)
             return
 
@@ -815,12 +1510,12 @@ class PlayerObject(GObject.GObject):
             self.play_track(track, gapless=gapless)
             return
 
-        if not self._tracks_to_play and self._repeat_type == RepeatType.LIST:
+        if not self.tracks_to_play and self._repeat_type == RepeatType.LIST:
             self._tracks_to_play = self.played_songs
-            self.tracks_to_play = self._tracks_to_play
             self.played_songs = []
+            self._update_shuffle_queue()
 
-        if not self._tracks_to_play:
+        if not self.tracks_to_play:
             self.pause()
             return
 
@@ -833,6 +1528,42 @@ class PlayerObject(GObject.GObject):
         if track_list and len(track_list) > 0:
             track = track_list.pop(0)
             self.play_track(track, gapless=gapless)
+
+    def skip_blocked(self) -> None:
+        """Leave out blocked tracks from what is left to play.
+
+        Removes them from the rest of the playing list and the played songs, and
+        skips the playing track if it was just blocked, as the official apps do.
+        """
+        self._drop_blocked()
+
+        if self.playing_track and utils.is_blocked_by_artist(self.playing_track):
+            has_next = (
+                self.queue
+                or self._tracks_to_play
+                or (self._repeat_type == RepeatType.LIST and self.played_songs)
+            )
+            if self._repeat_type == RepeatType.SONG or not has_next:
+                self.pause()
+            else:
+                self.play_next()
+                # play_next adds the blocked track to the played songs
+                self._drop_blocked()
+
+        self.can_go_next = len(self._tracks_to_play) > 0
+        self.emit("song-added-to-queue")
+
+    def _drop_blocked(self) -> None:
+        for track_list in (
+            self._tracks_to_play,
+            self._shuffled_tracks_to_play,
+            self.played_songs,
+        ):
+            track_list[:] = [
+                track
+                for track in track_list
+                if not utils.is_blocked_by_artist(track)
+            ]
 
     def play_previous(self):
         """Play the previous track or restart current track if near beginning."""
@@ -892,7 +1623,7 @@ class PlayerObject(GObject.GObject):
         Returns:
             float: Current volume level (0.0 to 1.0), adjusted for quadratic scaling if enabled
         """
-        volume = self.playbin.get_property("volume")
+        volume = self.volume.get_property("volume")
         if self.quadratic_volume:
             return round(volume ** (1 / 2), 1)
         else:
@@ -905,63 +1636,90 @@ class PlayerObject(GObject.GObject):
             value (float): Volume level (0.0 to 1.0), will be squared if quadratic volume is enabled
         """
         if self.quadratic_volume:
-            self.playbin.set_property("volume", value**2)
+            self._user_volume = value**2
         else:
-            self.playbin.set_property("volume", value)
+            self._user_volume = value
+        self.volume.set_property("volume", self._user_volume)
         self.emit("volume-changed", value)
 
     def _update_slider_callback(self):
         """Update playback slider and duration."""
-        self.update_timer = None
         if not self.duration:
             logger.warning("Duration missing, trying again")
             self.duration = self.query_duration()
-        self._check_stall()
+        if self.gapless_enabled and self.duration:
+            if self.duration - self.query_position() < 30 * Gst.SECOND:
+                self._prefetch_next_track()
+        self._check_stream_stuck()
         self.emit("update-slider")
+        if not self.playing:
+            # Returning False removes the timer. While it keeps running, keep its id
+            # so the next play() or track start replaces it instead of adding another
+            self.update_timer = None
         return self.playing
 
-    def _check_stall(self) -> None:
-        """Pause playback when the stream stalls and no data arrives.
+    def _check_stream_stuck(self) -> None:
+        """Recover when the stream of the playing track is stuck.
 
-        A frozen position plus a dead buffer (the buffering percentage not
-        growing) means the server stopped sending, not that the download is
-        just slow; pause and let the retry logic reconnect.
+        Continue from the music cache if the track is cached (e.g. the internet
+        went out). Otherwise, if the buffer stopped growing (a dead connection,
+        not a slow download), reconnect: re-fetch the stream for a fresh set of
+        urls and a fresh connection to the CDN, which may land on a faster edge.
         """
-        if not self.playing or self._stall_paused:
-            return
-        # The gapless handoff briefly freezes the position on purpose
-        if self.next_track:
-            return
-        # A cached local file has no network stream to refresh
-        if not self._current_uri or self._current_uri_is_local:
-            return
-
-        position = self.query_position(default=0)
+        position = self.query_position(-1)
         now = time.monotonic()
-        if position != self._last_position:
-            self._last_position = position
-            self._progress_at = now
-            # A retry that stays healthy clears its budget
-            if (
-                self._retry_attempts
-                and now - self._resume_at >= self.HEALTHY_AFTER
-            ):
-                self._retry_attempts = 0
+        if not self.playing or position != self.last_position:
+            self.last_position = position
+            self.position_stuck_since = now
+            self.stream_reconnects = 0
             return
-
-        stalled_for = now - self._progress_at
-        threshold = self.START_STALL_AFTER if position <= 0 else self.STALL_AFTER
-        if stalled_for < threshold:
+        # The position doesn't freeze during a gapless change (the concat
+        # switches seamlessly), so the safety net stays active while the
+        # next track is armed — including the last 30s, where a dead
+        # connection would otherwise stall the current track forever
+        if now - self.position_stuck_since < 3:
             return
-        # A buffer that is still growing means the download is slow, not dead
-        if now - self._buffer_changed_at < self.BUFFER_DEAD_FOR:
+        uri = self.current_uri
+        cached_music = self._cached_music_path(self.playing_track)
+        if cached_music and uri != f"file://{cached_music}":
+            self.position_stuck_since = now
+            self.stream_reconnects = 0
+            if position <= 0 and self.last_seek_position is not None:
+                # Stuck right after a seek, before anything could be downloaded
+                position = self.last_seek_position
+            duration = self.query_duration()
+            if duration and position > 0:
+                self.seek_after_sink_reload = position / duration
+            logger.warning("Stream stuck, continuing from the music cache")
+            self._play_track_url(self.playing_track, f"file://{cached_music}")
             return
-
-        logger.warning(
-            f"Stream stalled for {stalled_for:.0f}s at "
-            f"{position / Gst.SECOND:.1f}s, pausing and retrying"
+        # A plain local file has nothing to reconnect; only a network stream
+        # can be re-fetched.
+        if uri.startswith("file://"):
+            return
+        # A frozen position also happens while a slow download is still filling
+        # the buffer, and a reconnect discards that buffer. Only reconnect when
+        # the buffer stopped growing (dead connection), or, during the initial
+        # load, when it's taking so long that a fresh edge is worth a try.
+        buffer_dead = now - self.buffer_grew_since >= self.BUFFER_DEAD_FOR
+        load_too_long = (
+            position <= 0
+            and self.stream_load_started
+            and now - self.stream_load_started >= self.MAX_STREAM_LOAD
         )
-        self._begin_stall()
+        if not buffer_dead and not load_too_long:
+            return
+        if self.stream_reconnects >= self.MAX_STREAM_RECONNECTS:
+            # Gave up; don't retry on every timer tick
+            self.position_stuck_since = now
+            return
+        self.stream_reconnects += 1
+        self.position_stuck_since = now
+        logger.warning(
+            f"Stream stuck, buffer dead, reconnecting "
+            f"({self.stream_reconnects}/{self.MAX_STREAM_RECONNECTS})"
+        )
+        self._reload_track()
 
     def query_duration(self):
         """Get the duration of the current track.
@@ -969,7 +1727,7 @@ class PlayerObject(GObject.GObject):
         Returns:
             int: Duration in nanoseconds, or 0 if query failed
         """
-        success, duration = self.playbin.query_duration(Gst.Format.TIME)
+        success, duration = self.pipeline.query_duration(Gst.Format.TIME)
         return duration if success else 0
 
     def query_position(self, default=0) -> int | None:
@@ -981,32 +1739,29 @@ class PlayerObject(GObject.GObject):
         Returns:
             int: Position in nanoseconds, or default value if query failed
         """
-        success, position = self.playbin.query_position(Gst.Format.TIME)
+        success, position = self.pipeline.query_position(Gst.Format.TIME)
         return position if success else default
 
-    def seek(self, seek_fraction):
+    def seek(self, seek_fraction, accurate=False):
         """Seek to a position in the current track.
 
         Args:
             seek_fraction (float): Position as a fraction of total duration (0.0 to 1.0)
+            accurate (bool): Seek to the exact position instead of the nearest
+                keyframe, which can be seconds earlier in a stream
         """
-
-        # A user seek means we're no longer stalled (or on its way to it);
-        # drop any track url that was fetched for a stall retry so it can't
-        # restart playback from 0 after this seek
-        self._reset_stall()
-        self._load_seq += 1
 
         # If a seek close to the end is performed then skip
         # Avoids UI desync and stuck tracks
         if not self.seeked_to_end and seek_fraction > 0.98:
-            self.use_about_to_finish = False
             self.seeked_to_end = True
             self.play_next()
             return
         position = int(seek_fraction * self.query_duration())
-        self.playbin.seek_simple(
-            Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, position
+        flags = Gst.SeekFlags.ACCURATE if accurate else Gst.SeekFlags.KEY_UNIT
+        self.last_seek_position = position
+        self.pipeline.seek_simple(
+            Gst.Format.TIME, Gst.SeekFlags.FLUSH | flags, position
         )
 
         if self.discord_rpc_enabled:

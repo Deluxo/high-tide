@@ -46,6 +46,8 @@ This project follows a specific coding style. Please adhere to these guidelines 
 
 - Always handle exceptions in threaded operations
 - Use `GLib.idle_add()` for UI updates from background threads
+- Always start worker threads with `daemon=True`: a thread stuck in a network
+  request would otherwise keep the process alive after the user quits
 
 ```python
 def th_function(self):
@@ -59,7 +61,7 @@ def th_function(self):
         utils.get_favourites()
         GLib.idle_add(self.on_success)
 
-threading.Thread(target=self.th_function, args=()).start()
+threading.Thread(daemon=True, target=self.th_function, args=()).start()
 ```
 
 ### Error Handling

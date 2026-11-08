@@ -108,7 +108,7 @@ class Page(Adw.NavigationPage, IDisconnectable):
 
             GLib.idle_add(_loaded)
 
-        threading.Thread(target=_load).start()
+        threading.Thread(daemon=True, target=_load).start()
 
         return self
 
